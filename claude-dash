@@ -1,0 +1,1292 @@
+#!/bin/bash
+# claude-dash — one-screen control room for every running Claude Code session.
+#
+# Design 2b ("Table + Peek Pane"). Four stacked zones:
+#   HEADER  brand · fleet summary chips · total ctx · clock
+#   TABLE   one row per session (sticky selection cursor); idle overflow collapses
+#   PEEK    the selected session's live tail + inline permission actions
+#   INPUT   send an instruction straight to the selected session's stdin
+#
+# The point: manage the fleet without attaching to a terminal. Peek at any
+# session, answer its permission prompt, or send it an instruction — all from
+# here. Attach (jump in) only for a real conversation.
+#
+# Data source: the per-process metadata Claude Code writes to ~/.claude/sessions/
+# (pid, cwd, busy/idle/waiting status) paired with the session transcript in
+# ~/.claude/projects/ (context size, model, current tool, recent output).
+#
+# Keys (interactive):
+#   digits  type a row number to jump to its Terminal tab (⏎ to confirm 1–9)
+#   ↑/↓ j/k move the selection cursor (view scrolls, peek follows)
+#   ⏎       jump to the typed row, else attach to the selected session
+#   y / n   approve / deny the selected session's permission prompt (from here)
+#   s       send an instruction to the selected session
+#   v       speak a status briefing (press again / esc to stop)
+#   a       ask a question about the fleet by voice (dictate) or text; hear the answer
+#   tab     cycle to the next session needing you
+#   q       quit (sessions keep running)
+#
+# Usage:
+#   claude-dash          interactive
+#   claude-dash --once   print one frame and exit (for testing)
+#
+# Jump/send/answer target macOS Terminal.app tabs, matched by tty, via
+# System Events keystrokes — needs Terminal enabled under System Settings >
+# Privacy & Security > Accessibility (macOS prompts once).
+
+SESSIONS_DIR="$HOME/.claude/sessions"
+PROJECTS_DIR="$HOME/.claude/projects"
+REFRESH=1                       # seconds; bash 3.2 read -t rejects fractions
+BELL=1                          # ring terminal bell when a session flips to needs-you
+STALE_HOURS=12                  # sessions whose transcript started >this get a dim 'stale' marker (marathon sessions bloat context/cost)
+VOICE="Samantha"                # `say -v '?'` to list; premium voices sound best
+SPEECH_RATE=195                 # words per minute for spoken briefings/answers
+
+# ── color system (truecolor / 24-bit) ────────────────────────────────────────
+# The reference mock (design 2b) is specified in exact hex. Emit 24-bit
+# truecolor sequences (38;2;r;g;b / 48;2;r;g;b) so every color matches the
+# design pixel-for-pixel on a truecolor terminal (iTerm2, Ghostty, kitty,
+# WezTerm, modern tmux — anything advertising COLORTERM=truecolor). Foreground
+# codes stay fg-only (38;2 / 39) so they layer over a row background without
+# punching a hole in it. Every line is painted on the dark canvas (BG_MAIN);
+# rows that carry meaning (needs-you, selection, peek, input) get their own
+# tint — the design's rgba() overlays, pre-blended over the #04070F canvas.
+CORAL=$'\033[38;2;234;60;85m'    # #EA3C55  needs you / danger
+CYAN=$'\033[38;2;0;174;239m'     # #00AEEF  working / interactive keys
+AMBER=$'\033[38;2;245;166;35m'   # #F5A623  context pressure + brand mark
+GREEN=$'\033[38;2;47;191;113m'   # #2FBF71  healthy context
+BRIGHT=$'\033[38;2;234;244;248m' # #EAF4F8  active name / index
+BASE=$'\033[38;2;201;215;222m'   # #C9D7DE  body text
+STEEL=$'\033[38;2;143;166;176m'  # #8FA6B0  token counts / active age
+MUTED=$'\033[38;2;90;116;130m'   # #5A7482  idle rows / labels
+FAINT=$'\033[38;2;62;88;102m'    # #3E5866  hints / placeholder
+HAIR=$'\033[38;2;3;34;51m'       # cyan #00AEEF @16% over canvas — header/input rule
+HAIR_CORAL=$'\033[38;2;73;23;36m' # coral #EA3C55 @30% over canvas — peek divider
+OVERDASH=$'\033[38;2;19;22;29m'  # white @6% over canvas — idle-overflow separator
+DARK=$'\033[38;2;4;7;15m'        # #04070F  canvas color, for text on a badge
+
+FR=$'\033[39m'                     # foreground reset (keeps bg)
+RB=$'\033[49m'                     # background reset (keeps fg)
+B=$'\033[1m'; BOFF=$'\033[22m'     # bold on / off
+RST=$'\033[0m'                     # full reset (line ends)
+
+BG_MAIN=$'\033[48;2;4;7;15m'         # #04070F near-black canvas
+BG_NEED=$'\033[48;2;25;12;21m'       # coral @9%  (needs-you row tint)
+BG_SEL=$'\033[48;2;4;17;28m'         # cyan @6%   (selection cursor)
+BG_SELNEED=$'\033[48;2;34;14;24m'    # coral @13% (selected + needs-you)
+BG_PEEK=$'\033[48;2;3;6;11m'         # #03060B peek body (darkest)
+BG_PEEK_TITLE=$'\033[48;2;16;10;18m' # coral @5%  (peek title bar, needs-you)
+BG_INPUT=$'\033[48;2;6;13;22m'       # #060D16 input bar
+BG_TRACK=$'\033[48;2;10;22;34m'      # #0A1622 context-bar track
+BG_GREEN=$'\033[48;2;47;191;113m'    # context-bar fill (healthy)
+BG_AMBER=$'\033[48;2;245;166;35m'    # context-bar fill (pricey)
+BG_CORAL=$'\033[48;2;234;60;85m'     # context-bar fill (summarize) / badge
+BG_BADGE_NEED=$'\033[48;2;234;60;85m'
+BG_BADGE_WORK=$'\033[48;2;0;174;239m'
+BG_BADGE_IDLE=$'\033[48;2;90;116;130m'
+
+# The mock is an inset, rounded, bordered card floating on a darker page. The
+# page is #02040A (a hair darker than the card's #04070F); the 1px card border
+# is white @10% blended over the card → ~#1D2027. Rendered with box-drawing
+# glyphs (╭╮╰╯ │ ─ ├ ┤) and a left/right gutter of page background.
+PAGE_BG=$'\033[48;2;2;4;10m'      # #02040A  page behind the card
+BORDER=$'\033[38;2;41;47;56m'     # card border (white @10% over canvas, lifted a touch)
+
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# ── data collection ─────────────────────────────────────────────────────────
+
+# Last real user message in a transcript (skips tool results, meta, injected
+# system-reminder / caveat blocks). Transcripts run to tens of MB, so read only
+# the tail: grep candidate lines, then jq over the last handful.
+last_ask() {
+  local transcript="$1"
+  [ -f "$transcript" ] || return
+  tail -c 4000000 "$transcript" 2>/dev/null | grep -h '"type":"user"' | tail -30 | jq -r '
+    select(.type=="user" and (.isMeta != true)) | .message.content |
+    if type=="string" then .
+    elif type=="array" then ([.[] | select(.type=="text") | .text] | join(" "))
+    else empty end |
+    select(length>0) |
+    select(startswith("<")|not) |
+    select(startswith("Caveat")|not)' 2>/dev/null | tail -1
+}
+
+# One pass over the transcript tail -> "model|context|tool|toolarg".
+# Context is the full prompt size of the most recent API call (input + cache
+# read + cache creation) — the tokens re-sent every turn. /compact writes a
+# compact_boundary carrying the post-compaction size WITHOUT a new usage record,
+# so a compaction newer than the last usage line supersedes it. toolarg is the
+# file/command the current tool is acting on, for the working sub-line.
+session_stats() {
+  local transcript="$1"
+  [ -f "$transcript" ] || { printf '|||'; return; }
+  tail -n 400 "$transcript" 2>/dev/null | jq -Rrs '
+    [ split("\n")[] | fromjson? // empty ] as $all |
+    ($all | map(select(.type=="assistant"))) as $a |
+    ($a | map(select(.message.usage != null)) | last) as $u |
+    ($all | map(select(.type=="system" and .subtype=="compact_boundary")) | last) as $c |
+    ($a | map(.message.content? | select(type=="array") | .[]
+              | select(.type=="tool_use")) | last) as $lu |
+    ($lu.name // "") as $tool |
+    (((($lu.input.file_path // $lu.input.command // $lu.input.path
+        // $lu.input.pattern // $lu.input.url // $lu.input.description // "")
+       | tostring)) | gsub("[|\n\t]"; " ") | gsub("\\s+"; " ")) as $targ |
+    ($u.message.model // "") as $model |
+    (if $u == null then null else
+       ($u.message.usage.input_tokens // 0)
+       + ($u.message.usage.cache_read_input_tokens // 0)
+       + ($u.message.usage.cache_creation_input_tokens // 0)
+     end) as $utot |
+    (if ($c != null) and (($c.timestamp // "") > ($u.timestamp // ""))
+        then ($c.compactMetadata.postTokens // $utot)
+     else $utot end) as $ctx |
+    "\($model)|\($ctx // "")|\($tool)|\($targ)"' 2>/dev/null || printf '|||'
+}
+
+# Is this session a marathon? True iff the transcript's FIRST line carries a
+# timestamp older than STALE_HOURS. Reads only head -1 (cheap — no full scan in
+# the refresh loop). Missing file, empty/unparsable timestamp, or a date that
+# won't parse -> silent non-stale (exit 1, nothing on stderr).
+session_is_stale() {
+  local transcript="$1"
+  [ -f "$transcript" ] || return 1
+  local ts; ts=$(head -1 "$transcript" 2>/dev/null | jq -r '.timestamp // empty' 2>/dev/null)
+  [ -n "$ts" ] || return 1
+  local start now
+  # ISO-8601 (e.g. 2026-07-16T09:12:33.123Z) -> epoch, via BSD date. Strip any
+  # fractional seconds/zone the -f pattern won't consume; failure -> not stale.
+  local base="${ts%%.*}"; base="${base%Z}"   # drop fractional seconds and/or trailing Z
+  start=$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "$base" +%s 2>/dev/null) || return 1
+  [ -n "$start" ] || return 1
+  now=$(date +%s)
+  [ $(( now - start )) -ge $(( STALE_HOURS * 3600 )) ]
+}
+
+# Recent human-readable output lines for the peek pane. Emits tag<TAB>text:
+#   a = assistant prose · t = tool call · u = your message.  Newest last.
+peek_render() {
+  local transcript="$1" n="${2:-8}"
+  [ -f "$transcript" ] || return
+  tail -n 200 "$transcript" 2>/dev/null | jq -Rr '
+    fromjson? // empty
+    | select(.type=="assistant" or .type=="user")
+    | select(.isMeta != true)
+    | .type as $rt | .message.content as $c
+    | ( if ($c|type)=="string" then
+          (if $rt=="user" then "u\t› " + $c else "a\t" + $c end)
+        elif ($c|type)=="array" then
+          ($c[]
+            | if .type=="text" and ((.text//"")|length>0) then
+                (if $rt=="user" then "u\t› " else "a\t" end) + .text
+              elif .type=="tool_use" then
+                "t\t" + (.name | sub("^.*__"; "")) + " "
+                + ((.input.file_path // .input.command // .input.path
+                    // .input.pattern // .input.url // .input.description // "")
+                   | tostring)
+              else empty end)
+        else empty end )
+    | gsub("\n"; " ") | gsub("  +"; " ")
+    | select((split("\t")[1] // "") | length > 0)
+  ' 2>/dev/null | tail -n "$n"
+}
+
+short_model() { # claude-opus-4-8 -> opus-4.8, claude-fable-5 -> fable-5
+  sed -E 's/^claude-//; s/-[0-9]{8}$//; s/-([0-9]+)-([0-9]+)$/-\1.\2/' <<<"$1"
+}
+
+ctx_window() { # model short name -> context window in tokens
+  case "$1" in
+    *haiku*)                 echo 200000 ;;
+    *fable*|*mythos*|*opus*) echo 1000000 ;;
+    *sonnet-4.6*)            echo 1000000 ;;
+    *)                       echo 200000 ;;
+  esac
+}
+
+fmt_tok() { # 412345 -> 412k, 1000000 -> 1M, 1234567 -> 1.2M
+  local t=${1:-0}
+  if [ "$t" -ge 1000000 ]; then
+    if [ $(( t % 1000000 )) -eq 0 ]; then printf '%dM' $(( t / 1000000 ))
+    else printf '%d.%dM' $(( t / 1000000 )) $(( t % 1000000 / 100000 )); fi
+  else printf '%dk' $(( t / 1000 )); fi
+}
+
+# The meter measures per-turn COST, not window fill: even on a 1M model every
+# turn re-sends the whole context, so ~500k/turn is already expensive whatever
+# the ceiling. Bar fills toward that budget (or the window, whichever is
+# smaller, so small-window models still warn near their real limit).
+CTX_BUDGET=500000
+CTX_AMBER=50; CTX_RED=80
+
+ctx_scale() {
+  local w; w=$(ctx_window "$1")
+  if [ "$w" -lt "$CTX_BUDGET" ]; then echo "$w"; else echo "$CTX_BUDGET"; fi
+}
+
+ctx_pct() { # ctx_pct <tokens> <model> -> percent of scale, or -1 if unknown
+  local tok=$1 scale; scale=$(ctx_scale "$2")
+  case "$tok" in ''|*[!0-9]*) echo -1; return ;; esac
+  [ "$tok" -eq 0 ] && { echo -1; return; }
+  local p=$(( tok * 100 / scale )); [ $p -gt 100 ] && p=100; echo $p
+}
+
+# Thin meter + absolute token count, like the mock's 8px bar. The fill is drawn
+# with a lower-half block (▄) in the fill color over a dark track, so the bar
+# occupies only the lower band of the row — this both matches the mock's thin
+# bar and keeps vertically-adjacent bars from merging into one solid block
+# (a full-height fill in row N would touch row N+1's fill). Green <50%, amber
+# 50–80%, coral above; the token count picks up the same tone (steel healthy).
+CTX_BAR_W=12
+TRACK_FG=$'\033[38;2;16;28;42m'   # #101C2A  empty-track bar (thin, subtle)
+ctx_bar() { # ctx_bar <tokens> <model> <row-bg>
+  local tok="${1:-0}" rbg="$3" pct; pct=$(ctx_pct "$tok" "$2")
+  [ -z "$rbg" ] && rbg="$BG_MAIN"
+  # Both the fill and the empty track are drawn as lower-half blocks (▄) in
+  # foreground over the ROW background, so the meter is a single thin band (like
+  # the mock's 8px bar) with no full-height track box around it.
+  local k out="${rbg}"
+  if [ "$pct" -lt 0 ]; then
+    for (( k=0; k<CTX_BAR_W; k++ )); do out+="${TRACK_FG}▄"; done
+    printf '%s %s%-5s%s' "$out" "$FAINT" "—" "$FR"
+    return
+  fi
+  local fill=$(( pct * CTX_BAR_W / 100 )); [ $fill -lt 1 ] && [ $pct -gt 0 ] && fill=1
+  local ffg="$GREEN" tc="$STEEL"
+  [ $pct -ge $CTX_AMBER ] && { ffg="$AMBER"; tc="$AMBER"; }
+  [ $pct -ge $CTX_RED ]   && { ffg="$CORAL"; tc="$CORAL"; }
+  for (( k=0; k<CTX_BAR_W; k++ )); do
+    if [ $k -lt $fill ]; then out+="${ffg}▄"; else out+="${TRACK_FG}▄"; fi
+  done
+  printf '%s%s %s%-5s%s' "$out" "$rbg" "$tc" "$(fmt_tok "$tok")" "$FR"
+}
+
+rel_time() { # ms epoch -> "3m", "2h", "1d"
+  local ms="$1" now diff; now=$(date +%s); diff=$(( now - ms / 1000 ))
+  if   [ "$diff" -lt 60 ];    then echo "${diff}s"
+  elif [ "$diff" -lt 3600 ];  then echo "$(( diff / 60 ))m"
+  elif [ "$diff" -lt 86400 ]; then echo "$(( diff / 3600 ))h"
+  else                             echo "$(( diff / 86400 ))d"; fi
+}
+
+# Terminal tab custom titles keyed by tty ("ttys012<TAB>financing"). Launcher
+# scripts (e.g. acme/launch-tabs.sh) pin a slug onto the tab title, and
+# Claude Code's state file often carries no .name — so pinned tab titles are the
+# name fallback in collect(). One osascript per data scan (~100ms, read-only);
+# returns nothing if Terminal isn't running or no tab has a custom title.
+tab_titles() {
+  osascript 2>/dev/null <<'APPLESCRIPT'
+if application "Terminal" is not running then return ""
+set out to ""
+set d to character id 9 -- \t ("tab" is shadowed by Terminal's tab class inside the tell)
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if title displays custom title of t then
+          set ct to custom title of t
+          if ct is not "" then set out to out & (tty of t) & d & ct & linefeed
+        end if
+      end try
+    end repeat
+  end repeat
+end tell
+return out
+APPLESCRIPT
+}
+
+# Live sessions as sorted rows, triage order: needs-you -> working -> idle
+# (idle by recency). Fields (14):
+#   status|tty|pid|sid|transcript|project|age|name|ctx|model|tool|toolarg|reason|ask
+collect() {
+  local rows=""
+  # tty -> pinned-tab-title map, resolved once per scan. Strip the /dev/ prefix
+  # (so entries compare against `ps -o tty=` output) and Claude Code's status
+  # glyphs (✳/⠂ etc.) off the front of titles it pinned itself.
+  local tabmap; tabmap=$(tab_titles | sed -e 's|^/dev/||' -e $'s/\t[^a-zA-Z0-9]*/\t/')
+  for f in "$SESSIONS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local pid; pid=$(basename "$f" .json)
+    kill -0 "$pid" 2>/dev/null || continue
+    ps -o comm= -p "$pid" 2>/dev/null | grep -qi claude || continue
+
+    local status cwd sid name updated reason tty
+    IFS='|' read -r status cwd sid name updated reason < <(jq -r \
+      '[.status // "idle", .cwd, .sessionId, .name // "",
+        ((.updatedAt // .startedAt) | tostring), .waitingFor // ""] | join("|")' "$f")
+    tty=$(ps -o tty= -p "$pid" | tr -d ' ')
+    # No controlling terminal ('??' or empty) -> a detached/background Claude
+    # process (e.g. a spawned agent or the claude.exe helper), not an interactive
+    # tab. Every action here (jump/focus/send/answer) targets a Terminal tab by
+    # tty, so a ttyless row is a dead, unjumpable row that only pads the count and
+    # throws off the digit-jump numbering. Skip it.
+    case "$tty" in ''|'??') continue ;; esac
+
+    # Name fallback: no .name in the state file -> the session's pinned Terminal
+    # tab title (strip '|' so a title can't break the row format).
+    if [ -z "$name" ] && [ -n "$tabmap" ]; then
+      name=$(printf '%s\n' "$tabmap" | awk -F'\t' -v t="$tty" '$1==t{print $2; exit}' | tr -d '|')
+    fi
+    # Still no name (no .name, no pinned tab title) -> the terminal id, so several
+    # unnamed sessions in the same project (e.g. eight in acme/webapp) don't
+    # render as identical, indistinguishable rows. The tty is also what a jump
+    # targets, so it's a useful thing to show.
+    [ -z "$name" ] && name="$tty"
+
+    local project
+    case "$cwd" in
+      "$HOME/projects/"*) project="${cwd#"$HOME"/projects/}" ;;
+      "$HOME")            project="~" ;;
+      *)                  project=$(basename "$cwd") ;;
+    esac
+
+    local transcript="$PROJECTS_DIR/$(echo "$cwd" | sed 's/[\/._]/-/g')/$sid.jsonl"
+    local ask; ask=$(last_ask "$transcript" | tr '\n\t|' '   ' | sed 's/  */ /g')
+    local stats model ctx tool targ
+    stats=$(session_stats "$transcript")
+    IFS='|' read -r model ctx tool targ <<<"$stats"
+    model=$(short_model "$model")
+    local stale=0; session_is_stale "$transcript" && stale=1
+
+    local order
+    case "$status" in
+      waiting) order=0 ;;
+      busy)    order=1 ;;
+      shell)   order=2 ;;
+      *)       order=3 ;;
+    esac
+    rows+="$order|$updated|$status|$tty|$pid|$sid|$transcript|$project|$(rel_time "$updated")|$name|$ctx|$model|$tool|$targ|$stale|$reason|$ask"$'\n'
+  done
+  printf '%s' "$rows" | sort -t'|' -k1,1 -k2,2nr | cut -d'|' -f3-
+}
+
+# Parse $ROWS into parallel arrays R_* (1-indexed); sets NROWS.
+declare -a R_STATUS R_TTY R_PID R_SID R_TRANS R_PROJ R_AGE R_NAME R_CTX R_MODEL R_TOOL R_TARG R_STALE R_REASON R_ASK
+parse_rows() {
+  R_STATUS=() R_TTY=() R_PID=() R_SID=() R_TRANS=() R_PROJ=() R_AGE=() R_NAME=()
+  R_CTX=() R_MODEL=() R_TOOL=() R_TARG=() R_STALE=() R_REASON=() R_ASK=()
+  NROWS=0
+  local st tt pd sd tr pj ag nm cx md tl tg sl rs ak
+  while IFS='|' read -r st tt pd sd tr pj ag nm cx md tl tg sl rs ak; do
+    [ -n "$st" ] || continue
+    NROWS=$((NROWS+1))
+    R_STATUS[$NROWS]="$st"; R_TTY[$NROWS]="$tt";  R_PID[$NROWS]="$pd"; R_SID[$NROWS]="$sd"
+    R_TRANS[$NROWS]="$tr";  R_PROJ[$NROWS]="$pj";  R_AGE[$NROWS]="$ag"
+    R_NAME[$NROWS]="$nm";   R_CTX[$NROWS]="$cx";   R_MODEL[$NROWS]="$md"
+    R_TOOL[$NROWS]="$tl";   R_TARG[$NROWS]="$tg";  R_STALE[$NROWS]="$sl"
+    R_REASON[$NROWS]="$rs"; R_ASK[$NROWS]="$ak"
+  done <<<"$ROWS"
+}
+
+# ── layout helpers ──────────────────────────────────────────────────────────
+# ANSI escapes make printf's %-Ns width useless (it counts escape bytes), so
+# measure visible width with the escapes stripped. Pure-bash (no sed subprocess)
+# because emit/pad_to call this for every cell and every line, several hundred
+# times per frame — a fork per call would dominate the refresh. Strips any CSI
+# sequence (ESC [ … final-letter): SGR colors, erase-line, cursor codes.
+strip_ansi() {
+  local s="$1" ESC=$'\033' out=""
+  while [[ $s == *"$ESC["* ]]; do
+    out+="${s%%"$ESC["*}"
+    s="${s#*"$ESC["}"
+    while [[ -n "$s" && "$s" != [a-zA-Z]* ]]; do s="${s#?}"; done
+    s="${s#[a-zA-Z]}"
+  done
+  printf '%s' "$out$s"
+}
+
+vis_len() { local p; p=$(strip_ansi "$1"); printf '%s' "${#p}"; }
+
+pad_to() { # pad_to <visible-width> <string> -> left-justified to width
+  local w=$1 s=$2 plain; plain=$(strip_ansi "$s")
+  printf '%s' "$s"; [ ${#plain} -lt "$w" ] && printf '%*s' $(( w - ${#plain} )) ''
+}
+
+clip() { # clip <max> <string> (plain text) -> truncated with …
+  local m=$1 s=$2; [ ${#s} -le "$m" ] && { printf '%s' "$s"; return; }
+  printf '%s…' "${s:0:$(( m - 1 ))}"
+}
+
+# Per-project identity color. Each project (the first path segment — acme, webapp,
+# …) hashes to a stable hue so you can pick a project out of the
+# table at a glance. This is an identity axis, separate from the semantic colors
+# (coral=needs-you, cyan=working) which live in the STATUS column. Palette is a
+# set of pastels that read well on the dark canvas and stay distinct from the
+# status hues. Sets PCOLOR to a truecolor fg escape.
+# Hues span blue→purple→magenta→peach→gold→lime→teal→sky so adjacent buckets
+# stay distinguishable; none sits near the semantic coral/cyan/amber/green.
+PROJ_PALETTE=(
+  '122;162;247'   # blue
+  '187;154;247'   # purple
+  '216;140;210'   # magenta
+  '235;150;165'   # blush
+  '255;158;100'   # peach
+  '214;185;120'   # gold-tan
+  '190;205;120'   # lime
+  '130;205;180'   # teal
+  '130;200;250'   # sky
+  '165;180;235'   # slate-blue
+)
+project_color() { # project_color <client>
+  local s="$1" idx
+  # Known clients get a fixed, distinct slot (bash 3.2 has no associative arrays,
+  # so a case does the lookup). Unknown dirs fall back to a hash. Edit this list
+  # when you add a client folder under ~/projects.
+  case "$s" in
+    acme)           idx=0 ;;
+    webapp)         idx=1 ;;
+    blog)           idx=2 ;;
+    *)
+      local h=0 i c
+      for (( i=0; i<${#s}; i++ )); do
+        printf -v c '%d' "'${s:$i:1}"
+        h=$(( (h * 131 + c) % 2147483647 ))
+      done
+      idx=$(( h % ${#PROJ_PALETTE[@]} ))
+      ;;
+  esac
+  PCOLOR=$'\033[38;2;'"${PROJ_PALETTE[$idx]}"'m'
+}
+
+# ── rendering ───────────────────────────────────────────────────────────────
+
+# Every content line goes through emit, which frames it as one row of the card:
+#   [page gutter] │ [content padded to WIDTH with the row bg] │ [page gutter]
+# WIDTH is the card's INNER width, so each render_* function still pads to WIDTH
+# and emit wraps it in the border + gutter. Ends with erase-to-EOL (clears any
+# leftover from a longer previous frame), painting the right gutter page-dark.
+emit() { # emit <bg-or-empty> <content>  (empty bg -> card canvas)
+  local bg="$1"; [ -z "$bg" ] && bg="$BG_MAIN"
+  local content="$2" vl filln
+  vl=$(vis_len "$content"); filln=$(( WIDTH - vl )); [ $filln -lt 0 ] && filln=0
+  FRAME+="${PAGE_BG}${GUTTER_S}${bg}${BORDER}│${bg}${content}${bg}$(printf '%*s' "$filln" '')${BORDER}│${PAGE_BG}"$'\033[K'"$RST"$'\n'
+  FLINES=$((FLINES+1))
+}
+
+# A horizontal rule spanning the card interior, tied into the side borders as
+# ├──────┤ in the given color (header/peek/input dividers).
+emit_divider() { # emit_divider <color>
+  FRAME+="${PAGE_BG}${GUTTER_S}${BG_MAIN}${1}├$(printf '%*s' "$WIDTH" '' | tr ' ' '─')┤${PAGE_BG}"$'\033[K'"$RST"$'\n'
+  FLINES=$((FLINES+1))
+}
+
+# The rounded top (╭──╮) or bottom (╰──╯) edge of the card.
+emit_border() { # emit_border <top|bottom>
+  local lc="╭" rc="╮"; [ "$1" = bottom ] && { lc="╰"; rc="╯"; }
+  FRAME+="${PAGE_BG}${GUTTER_S}${BG_MAIN}${BORDER}${lc}$(printf '%*s' "$WIDTH" '' | tr ' ' '─')${rc}${PAGE_BG}"$'\033[K'"$RST"$'\n'
+  FLINES=$((FLINES+1))
+}
+
+# Colorize one status cell for a row.
+status_cell() { # status_cell <status> <tool> <age> <blink>
+  local s="$1" tool="$2" age="$3" blink="$4"
+  case "$s" in
+    waiting)
+      local tri="▲"; [ "$blink" = 0 ] && tri="${FAINT}▲${CORAL}"
+      printf '%s%s%s needs you%s' "$CORAL$B" "$tri" "" "$BOFF" ;;
+    busy)
+      local t="${tool##*__}"; [ -n "$t" ] || t="working"
+      printf '%s● %s%s' "$CYAN" "$(clip 11 "$t")" "$FR" ;;
+    shell)
+      printf '%s❯ shell%s' "$CYAN" "$FR" ;;
+    *)
+      if [[ "$age" == *d ]] || [[ "$age" == *h ]]; then
+        printf '%s○ idle %s%s' "$MUTED" "$age" "$FR"
+      else printf '%s○ idle%s' "$MUTED" "$FR"; fi ;;
+  esac
+}
+
+# Header: brand · fleet chips · total ctx · clock, then a hairline rule.
+render_header() {
+  local busy_n=0 idle_n=0 need_n=0 ctx_total=0 i
+  for (( i=1; i<=NROWS; i++ )); do
+    case "${R_STATUS[$i]}" in
+      busy|shell) busy_n=$((busy_n+1)) ;;
+      waiting)    need_n=$((need_n+1)) ;;
+      *)          idle_n=$((idle_n+1)) ;;
+    esac
+    case "${R_CTX[$i]}" in ''|*[!0-9]*) ;; *) ctx_total=$(( ctx_total + R_CTX[$i] )) ;; esac
+  done
+
+  local blink=$(( $(date +%s) % 2 ))
+  local left="${AMBER}${B}⚡ CLAUDE CODE${BOFF}${FR}"
+  local chips=""
+  if [ "$need_n" -gt 0 ]; then
+    local tri="▲"; [ "$blink" = 0 ] && tri="${FAINT}▲${CORAL}${B}"
+    chips+="${CORAL}${B}${tri} ${need_n} NEEDS YOU${BOFF}${FR}  "
+  fi
+  chips+="${CYAN}● ${busy_n} working${FR}  ${MUTED}○ ${idle_n} idle${FR}"
+  local right="${MUTED}ctx ${FR}${BASE}$(fmt_tok "$ctx_total")${MUTED}   ${BASE}$(date +%H:%M:%S)${FR}"
+
+  # Budget every visible cell so the clock never spills past the edge (which,
+  # with line-wrap off, would truncate it): 1 leading space + left + ⚡ renders
+  # 2 cells for 1 codepoint (+1) + 3 separators + chips + right, plus a 2-cell
+  # right margin so the clock sits inside the edge like the mock's card padding.
+  local lv rv used pad
+  lv=$(vis_len "$left"); rv=$(vis_len "$right")
+  used=$(( 1 + lv + 1 + 3 + $(vis_len "$chips") + rv + 2 ))
+  pad=$(( WIDTH - used )); [ $pad -lt 1 ] && pad=1
+  emit "" " ${left}   ${chips}$(printf '%*s' "$pad" '')${right}"
+  emit_divider "$HAIR"
+}
+
+# One session row (+ optional sub-line). $1 index, $2 = selected?
+render_row() {
+  local i="$1" selected="$2" blink=$(( $(date +%s) % 2 ))
+  local st="${R_STATUS[$i]}" need=0; [ "$st" = waiting ] && need=1
+
+  # row background: needs-you tint, selection tint, or their blend
+  local bg=""
+  if [ "$need" = 1 ] && [ "$selected" = 1 ]; then bg="$BG_SELNEED"
+  elif [ "$need" = 1 ]; then bg="$BG_NEED"
+  elif [ "$selected" = 1 ]; then bg="$BG_SEL"; fi
+
+  local ebg="$bg"; [ -z "$ebg" ] && ebg="$BG_MAIN"
+  local active=0; case "$st" in waiting|busy|shell) active=1 ;; esac
+
+  # left border: 3px coral bar for needs-you, cyan for a plain selection
+  local mark=" "
+  if [ "$need" = 1 ]; then mark="${CORAL}▌${FR}"
+  elif [ "$selected" = 1 ]; then mark="${CYAN}▌${FR}"; fi
+
+  # jump index — bright for active rows, steel for idle (both bold)
+  local ic="$STEEL"; [ "$active" = 1 ] && ic="$BRIGHT"
+  local idx="${ic}${B}$(pad_to $IDX_W "$i")${BOFF}${FR}"
+
+  # session name — project (client) in its identity color, the "· detail" in
+  # bright (active) or muted (idle). Truncated as a whole, then recolored.
+  project_color "${R_PROJ[$i]%%/*}"
+  local sess="${R_PROJ[$i]}"; [ -n "${R_NAME[$i]}" ] && sess+=" · ${R_NAME[$i]}"
+  sess=$(clip $SESS_W "$sess")
+  local sc="$MUTED"; [ "$active" = 1 ] && sc="$BRIGHT"
+  local colored
+  if [[ "$sess" == *" · "* ]]; then
+    colored="${PCOLOR}${sess%% · *}${sc} · ${sess#* · }${FR}"
+  else
+    colored="${PCOLOR}${sess}${FR}"
+  fi
+  local namecell; namecell=$(pad_to $SESS_W "$colored")
+
+  # context — solid filled bar; pass row bg so it restores after the bar cells
+  local ctxcell; ctxcell=$(ctx_bar "${R_CTX[$i]}" "${R_MODEL[$i]}" "$ebg")
+
+  # model — muted on every row
+  local m="${R_MODEL[$i]}"; case "$m" in ''|'<'*) m="—" ;; esac; m=$(clip $MODEL_W "$m")
+  local modelcell="${MUTED}$(pad_to $MODEL_W "$m")${FR}"
+
+  # activity age — steel (active) or muted (idle)
+  local ac="$MUTED"; [ "$active" = 1 ] && ac="$STEEL"
+  local actcell="${ac}$(pad_to $ACT_W "${R_AGE[$i]}")${FR}"
+
+  # status
+  local stcell; stcell=$(status_cell "$st" "${R_TOOL[$i]}" "${R_AGE[$i]}" "$blink")
+  # stale marker — a quiet amber tag on marathon sessions (transcript started
+  # >STALE_HOURS ago). Status is the last column, so appending here can't shift
+  # any other column; emit() recomputes the row fill from visible width.
+  [ "${R_STALE[$i]}" = 1 ] && stcell+="  ${AMBER}⧗ stale${FR}"
+
+  emit "$bg" " ${mark} ${idx}  ${namecell}  ${ctxcell}  ${modelcell}  ${actcell}  ${stcell}"
+  # airy spacer under the row (the mock's row padding). Carries the same tint and
+  # continues the left accent bar, so a needs-you/selected highlight reads as a
+  # tall band rather than a single thin line.
+  [ "${ROW_H:-1}" -ge 2 ] && emit "$bg" " ${mark}"
+}
+
+# The peek pane for the selected session.
+render_peek() {
+  local i="$SEL_IDX"
+  # divider between table and peek — coral for a needs-you selection (HTML:
+  # border-top coral @30%), dim-cyan otherwise
+  local dstat=""; [ -n "$i" ] && dstat="${R_STATUS[$i]}"
+  local rule="$HAIR"; [ "$dstat" = waiting ] && rule="$HAIR_CORAL"
+  emit_divider "$rule"
+  if [ "$NROWS" -eq 0 ] || [ -z "$i" ]; then
+    emit "$BG_PEEK" " ${MUTED}no session selected${FR}"
+    local k; for (( k=0; k<PEEK_BODY; k++ )); do emit "$BG_PEEK" ""; done
+    return
+  fi
+
+  local st="${R_STATUS[$i]}" blink=$(( $(date +%s) % 2 ))
+  # numbered badge, colored by state
+  local badge_bg="$BG_BADGE_IDLE" state="idle"
+  case "$st" in
+    waiting) badge_bg="$BG_BADGE_NEED"; state="needs you" ;;
+    busy)    badge_bg="$BG_BADGE_WORK"; state="working" ;;
+    shell)   badge_bg="$BG_BADGE_WORK"; state="shell" ;;
+  esac
+  # title bar carries a coral @5% tint for a needs-you request; peek bg otherwise
+  local tbg="$BG_PEEK"; [ "$st" = waiting ] && tbg="$BG_PEEK_TITLE"
+  local badge="${badge_bg}${DARK}${B} ${i} ${BOFF}${FR}${tbg}"
+  local path="${R_PROJ[$i]}"; [ -n "${R_NAME[$i]}" ] && path+=" / ${R_NAME[$i]}"
+
+  local label right
+  if [ "$st" = waiting ]; then
+    local tri="▲"; [ "$blink" = 0 ] && tri="${FAINT}▲${CORAL}${B}"
+    label="${CORAL}${B}${tri} PERMISSION REQUEST${BOFF}${FR}"
+  else
+    label="${MUTED}${state}${FR}"
+  fi
+  right="${FAINT}↑↓ select row to peek${FR}"
+  local title=" ${badge} ${BRIGHT}$(clip $(( WIDTH - 40 )) "$path")${FR}  ${label}"
+  local pad=$(( WIDTH - $(vis_len "$title") - $(vis_len "$right") - 1 ))
+  [ $pad -lt 1 ] && pad=1
+  emit "$tbg" "${title}$(printf '%*s' "$pad" '')${right} "
+
+  # Body: a few recent output lines, dim gray, airy (mock: padding 12px 20px,
+  # line-height 1.7) — a padded, breathing box, NOT a cramped log dump. A blank
+  # line pads the top; a blank spacer separates each line. Fewer lines than the
+  # spec's "~8" because with spacing they'd overflow; 4 reads as a calm glance.
+  emit "$BG_PEEK" ""
+  local body_n=4; [ "$st" = waiting ] && body_n=2
+  local lines; lines=$(peek_render "${R_TRANS[$i]}" "$body_n")
+  local tag text first=1
+  while IFS=$'\t' read -r tag text; do
+    [ -n "$tag$text" ] || continue
+    [ "$first" = 1 ] || emit "$BG_PEEK" ""      # airy spacer between lines
+    first=0
+    local c="$MUTED"; [ "$tag" = t ] && c="$FAINT"
+    emit "$BG_PEEK" "   ${c}$(clip $(( WIDTH - 5 )) "$text")${FR}"
+  done <<<"$lines"
+
+  # inline permission actions — answer without attaching (bright command +
+  # buttons, set off from the reasoning above with a blank line, like the mock)
+  if [ "$st" = waiting ]; then
+    local tool="${R_TOOL[$i]##*__}"
+    local cmd="${R_TARG[$i]}"; [ -z "$cmd" ] && cmd="${R_REASON[$i]}"
+    # if the pending tool wasn't captured, lead with the request reason instead
+    [ -z "$tool" ] && { tool="request"; [ -n "$cmd" ] || cmd="awaiting your approval"; }
+    emit "$BG_PEEK" ""
+    emit "$BG_PEEK" "   ${BRIGHT}${tool}  ${BASE}$(clip $(( WIDTH - 7 - ${#tool} )) "$cmd")${FR}"
+    emit "$BG_PEEK" ""
+    local yb="${BG_CORAL}${DARK}${B} Y APPROVE ${BOFF}${FR}${BG_PEEK}"
+    local nb="${BG_TRACK}${STEEL} N DENY ${FR}${BG_PEEK}"
+    local ob="${BG_TRACK}${CYAN} ⏎ OPEN ${FR}${BG_PEEK}"
+    emit "$BG_PEEK" "   ${yb}  ${nb}  ${ob}"
+  fi
+  emit "$BG_PEEK" ""                              # bottom padding
+}
+
+# The instruction bar + key legend.
+render_input() {
+  local i="$SEL_IDX" tgt="—"
+  [ -n "$i" ] && tgt="$i"
+  # dim-cyan hairline divides the peek body from the input bar (HTML: input
+  # border-top cyan @14%)
+  emit_divider "$HAIR"
+  local blink=$(( $(date +%s) % 2 )) cur="▍"; [ "$blink" = 0 ] && cur=" "
+  local prompt right
+  if [ -n "$GOTO" ]; then
+    # live "go to session N" buffer — digits accumulate here (no blocking read,
+    # no timeout), so typing a two-digit row always lands on it however fast or
+    # slow you type, and a lone lead digit never jumps to the wrong tab.
+    prompt="${CYAN}${B}⇢${BOFF}${FR} ${BRIGHT}jump to session ${GOTO}${CYAN}${cur}${FR}"
+    right="${FAINT}another digit · ${CYAN}⏎${FAINT} go · ${CYAN}esc${FAINT} cancel${FR}"
+  elif [ "${ASKING:-0}" = 1 ]; then
+    prompt="${CYAN}🤔${FR} ${STEEL}thinking…${FR}"
+    right="${FAINT}Claude is answering${FR}"
+  elif speaking; then
+    prompt="${CYAN}🔊${FR} ${BASE}$(clip $(( WIDTH - 16 )) "$ANSWER")${FR}"
+    right="${FAINT}${CYAN}esc${FAINT} stop${FR}"
+  elif [ -n "$CMD_MSG" ]; then
+    # transient status after an action (sent / broadcast / killed / help) — take
+    # the full width, no right hint, so longer messages aren't truncated
+    prompt="${CYAN}${B}›${BOFF}${FR} ${STEEL}$(clip $(( WIDTH - 4 )) "$CMD_MSG")${FR}"
+    right=""
+    CMD_MSG=""     # consume: shown for this frame only
+  else
+    prompt="${CYAN}${B}›${BOFF}${FR} ${FAINT}send an instruction to session ${tgt}…${CYAN}${cur}${FR}"
+    # in the idle state the useful hint is the keys, not SEND/CANCEL (which only
+    # apply while typing); ? opens the full shortcuts panel
+    right="${FAINT}${CYAN}v${FAINT} speak · ${CYAN}a${FAINT} ask · ${CYAN}s${FAINT} send · ${CYAN}?${FAINT} help${FR}"
+  fi
+  local pad=$(( WIDTH - $(vis_len "$prompt") - $(vis_len "$right") - 2 ))
+  [ $pad -lt 1 ] && pad=1
+  emit "$BG_INPUT" " ${prompt}$(printf '%*s' "$pad" '')${right} "
+}
+
+# Column geometry. SESS_W is derived so STATUS gets the remainder.
+IDX_W=2; CTX_W=18; MODEL_W=8; ACT_W=4; STATUS_W=15
+# The card floats on the page with a gutter each side; cap its outer width so it
+# stays card-shaped (not a full-bleed banner) on very wide terminals.
+CARD_MAX=118; GUTTER_MIN=2
+compute_geometry() {
+  local cols lines outer
+  cols=${DASH_COLS:-$(tput cols 2>/dev/null || echo 120)}
+  lines=${DASH_LINES:-$(tput lines 2>/dev/null || echo 40)}
+  LINES_T=$lines; COLS_T=$cols
+
+  # card outer width (incl. the two │ borders), centered with a page gutter
+  outer=$(( cols - 2 * GUTTER_MIN ))
+  [ $outer -gt $CARD_MAX ] && outer=$CARD_MAX
+  [ $outer -lt 48 ] && outer=$(( cols < 48 ? cols : 48 ))
+  GUTTER=$(( (cols - outer) / 2 )); [ $GUTTER -lt 0 ] && GUTTER=0
+  GUTTER_S=$(printf '%*s' "$GUTTER" '')
+  WIDTH=$(( outer - 2 ))    # inner content width, between the side borders
+
+  # session name fills the gap so CONTEXT/MODEL/ACT/STATUS sit at the right edge
+  SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - MODEL_W - ACT_W - STATUS_W - 14 ))
+  [ $SESS_W -lt 16 ] && SESS_W=16
+  [ $SESS_W -gt 48 ] && SESS_W=48
+
+  # ROW_H=2 gives each row an airy spacer line under it (the mock's row padding);
+  # drop to 1 on short terminals so more sessions still fit.
+  ROW_H=2
+  PEEK_BODY=9; SUBLINES=0; SHOW_PEEK=1        # airy peek: pad + ~4 lines + spacers
+  if [ "$LINES_T" -lt 30 ]; then SHOW_PEEK=0; fi
+  if [ "$LINES_T" -lt 24 ]; then ROW_H=1; fi
+  local peek_h=0
+  [ "$SHOW_PEEK" = 1 ] && peek_h=$(( 1 + 1 + PEEK_BODY ))   # rule + title + body region
+  # borders (top+bottom) = 2, header = brand + rule = 2, input = rule + bar = 2
+  local border_h=2 header_h=2 input_h=2
+  TABLE_CAP=$(( LINES_T - border_h - header_h - peek_h - input_h ))
+  [ $TABLE_CAP -lt 3 ] && TABLE_CAP=3
+}
+
+render() {
+  FRAME=""; FLINES=0
+  emit_border top
+  render_header
+
+  if [ "$NROWS" -eq 0 ]; then
+    emit "" ""
+    emit "" "  ${MUTED}no live sessions — quiet out there${FR}"
+  else
+    # (no column-header row — the mock goes straight from the header rule to
+    # row 1; columns are self-evident from the data.)
+
+    # Scrolling viewport. Render a contiguous window of rows that always keeps
+    # the selection visible, with "N more above/below" affordances when the
+    # fleet overflows. This replaces the old "collapse trailing idle" scheme,
+    # whose flaw was that the selection cursor could still move onto a hidden
+    # (collapsed) row — so ↑/↓ looked dead, and sessions past the visible set
+    # (including everything past #10, which has no jump key) were unreachable.
+    local i vis cap=$TABLE_CAP
+    if [ $(( NROWS * ROW_H )) -le "$cap" ]; then
+      vis=$NROWS                                   # whole fleet fits, no scroll
+    else
+      vis=$(( (cap - 2) / ROW_H )); [ $vis -lt 1 ] && vis=1   # reserve 2 lines for indicators
+    fi
+    # keep SEL_IDX inside the window [TOP_IDX, TOP_IDX+vis-1]; TOP_IDX persists
+    # across frames so the view doesn't jump around on a data rescan.
+    [ -z "$TOP_IDX" ] && TOP_IDX=1
+    if [ -n "$SEL_IDX" ]; then
+      [ "$SEL_IDX" -lt "$TOP_IDX" ] && TOP_IDX=$SEL_IDX
+      [ "$SEL_IDX" -ge $(( TOP_IDX + vis )) ] && TOP_IDX=$(( SEL_IDX - vis + 1 ))
+    fi
+    local maxtop=$(( NROWS - vis + 1 )); [ $maxtop -lt 1 ] && maxtop=1
+    [ "$TOP_IDX" -lt 1 ] && TOP_IDX=1
+    [ "$TOP_IDX" -gt "$maxtop" ] && TOP_IDX=$maxtop
+    local bot=$(( TOP_IDX + vis - 1 )); [ $bot -gt "$NROWS" ] && bot=$NROWS
+
+    if [ "$TOP_IDX" -gt 1 ]; then
+      emit "" "   ${CYAN}↑${FAINT} $(( TOP_IDX - 1 )) more above${FR}"
+    fi
+    for (( i=TOP_IDX; i<=bot; i++ )); do
+      local sel=0; [ "$i" = "$SEL_IDX" ] && sel=1
+      render_row "$i" "$sel"
+    done
+    if [ "$bot" -lt "$NROWS" ]; then
+      emit "" "   ${CYAN}↓${FAINT} $(( NROWS - bot )) more below${FR}"
+    fi
+  fi
+
+  # peek + input follow the table directly (no middle gap): the card is compact.
+  [ "$SHOW_PEEK" = 1 ] && render_peek
+  render_input
+  emit_border bottom
+
+  # The card is content-height; float it on the page like the mock (a compact,
+  # top-aligned card, not a full-bleed panel). Pad the page above with a small
+  # top margin and fill the rest below with page background so the redraw still
+  # covers the whole terminal. INPUT_ROW records the input line's screen row for
+  # focus_input (it's the second-to-last card line: … input, bottom border).
+  local card_h=$FLINES top_m=1 extra
+  extra=$(( LINES_T - card_h )); [ $extra -lt 0 ] && extra=0
+  [ $top_m -gt $extra ] && top_m=$extra
+  INPUT_ROW=$(( top_m + card_h - 1 ))
+  local pm="" bf="" k
+  for (( k=0; k<top_m; k++ )); do pm+="${PAGE_BG}"$'\033[K'"$RST"$'\n'; done
+  for (( k=0; k<extra-top_m; k++ )); do bf+="${PAGE_BG}"$'\033[K'"$RST"$'\n'; done
+  FRAME="${pm}${FRAME}${bf}"
+  [ $extra -ge 0 ] && FLINES=$LINES_T
+}
+
+# ── selection state ─────────────────────────────────────────────────────────
+# Selection is sticky by session id so it survives re-sorts.
+resolve_selection() {
+  SEL_IDX=""
+  local i
+  if [ -n "$SEL_SID" ]; then
+    for (( i=1; i<=NROWS; i++ )); do
+      [ "${R_SID[$i]}" = "$SEL_SID" ] && { SEL_IDX=$i; break; }
+    done
+  fi
+  if [ -z "$SEL_IDX" ] && [ "$NROWS" -gt 0 ]; then
+    SEL_IDX=1; SEL_SID="${R_SID[1]}"      # top row = highest triage priority
+  fi
+}
+
+move_sel() { # move_sel <-1|+1>
+  [ "$NROWS" -gt 0 ] || return
+  local n=$(( SEL_IDX + $1 ))
+  [ $n -lt 1 ] && n=1; [ $n -gt "$NROWS" ] && n="$NROWS"
+  SEL_IDX=$n; SEL_SID="${R_SID[$n]}"
+}
+
+next_alert() { # cycle to the next session in waiting state
+  [ "$NROWS" -gt 0 ] || return
+  local i j
+  for (( i=1; i<=NROWS; i++ )); do
+    j=$(( (SEL_IDX + i - 1) % NROWS + 1 ))
+    [ "${R_STATUS[$j]}" = waiting ] && { SEL_IDX=$j; SEL_SID="${R_SID[$j]}"; return; }
+  done
+}
+
+# ── terminal actions (osascript) ────────────────────────────────────────────
+focus_tab() { # focus_tab <tty>
+  osascript >/dev/null 2>&1 <<EOF
+tell application "Terminal"
+  activate
+  repeat with w in windows
+    repeat with t in tabs of w
+      if tty of t is "/dev/$1" then
+        set selected of t to true
+        set index of w to 1
+        return
+      end if
+    end repeat
+  end repeat
+end tell
+EOF
+}
+
+send_keys() { # send_keys <tty> <applescript-keystroke-body> [return-to-dash]
+  focus_tab "$1"
+  osascript >/dev/null 2>&1 <<EOF
+tell application "System Events"
+  delay 0.35
+  $2
+end tell
+EOF
+  [ -n "$3" ] && focus_tab "$3"
+}
+
+send_message() { # send_message <tty> <text> [return-tty]  ("" = don't return)
+  local msg="${2//\\/\\\\}"; msg="${msg//\"/\\\"}"
+  send_keys "$1" "keystroke \"$msg\"
+  delay 0.15
+  key code 36" "${3-$DASH_TTY}"
+}
+
+# Answer the selected session's permission prompt from the dashboard.
+# approve -> press 1 (approve once); deny -> Escape (cancels the prompt).
+answer_prompt() { # answer_prompt <tty> <approve|deny>
+  if [ "$2" = approve ]; then
+    send_keys "$1" "keystroke \"1\"" "$DASH_TTY"
+  else
+    send_keys "$1" "key code 53" "$DASH_TTY"   # 53 = Escape
+  fi
+}
+
+# Draw a prompt at the (floating) input line and read one echoed line into
+# REPLY_LINE. The card's input line moves with the card, so use INPUT_ROW.
+prompt_line() { # prompt_line <label-with-escapes>
+  local row=${INPUT_ROW:-$(( LINES_T - 1 ))}; [ $row -lt 1 ] && row=1
+  printf '\033[%d;1H\033[K\033[?25h' "$row"
+  printf ' %s' "$1"
+  # This reads a whole line, so temporarily restore canonical + echo (the key
+  # loop runs the tty in raw/no-echo mode) — otherwise the typed text is neither
+  # visible nor line-editable. Back to raw afterward for the key loop.
+  stty icanon echo 2>/dev/null
+  IFS= read -r REPLY_LINE
+  stty -icanon -echo min 1 time 0 2>/dev/null
+  printf '\033[?25l'
+}
+
+# `s` — send an instruction to the selected session. If it's working, the text
+# is still delivered to its stdin; Claude Code queues it and runs it after the
+# current turn (so this doubles as "queue to a busy session").
+focus_input() {
+  [ -n "$SEL_IDX" ] || return
+  local verb="→ send to" q=""
+  case "${R_STATUS[$SEL_IDX]}" in busy|shell) verb="⇢ queue for"; q=" (running — will run after this turn)" ;; esac
+  prompt_line "${CYAN}›${FR} ${BRIGHT}${verb} session ${SEL_IDX}${FAINT}${q}:${RST} "
+  [ -n "$REPLY_LINE" ] && { send_message "${R_TTY[$SEL_IDX]}" "$REPLY_LINE"; CMD_MSG="sent to session ${SEL_IDX}"; last_data=0; }
+}
+
+# `b` — broadcast one instruction to every live session (with a confirm, since
+# it types into N terminals). Skips the per-session tab-return for speed, then
+# returns focus to the dashboard once.
+broadcast() {
+  [ "$NROWS" -gt 0 ] || return
+  prompt_line "${AMBER}⇉${FR} ${BRIGHT}broadcast to all ${NROWS} sessions:${RST} "
+  local msg="$REPLY_LINE"; [ -n "$msg" ] || return
+  prompt_line "${CORAL}⇉ send to ALL ${NROWS}? type 'y' to confirm:${RST} "
+  case "$REPLY_LINE" in y|Y|yes|YES) ;; *) CMD_MSG="broadcast cancelled"; return ;; esac
+  local i
+  for (( i=1; i<=NROWS; i++ )); do send_message "${R_TTY[$i]}" "$msg" ""; done
+  focus_tab "$DASH_TTY"
+  CMD_MSG="broadcast to ${NROWS} sessions"; last_data=0
+}
+
+# `:` — command mode for dashboard actions. Verb + optional arg; target is the
+# selected row unless a number is given.
+command_mode() {
+  prompt_line "${CYAN}:${RST} "
+  local line="$REPLY_LINE" verb arg t="$SEL_IDX"
+  [ -n "$line" ] || return
+  verb="${line%% *}"; arg="${line#"$verb"}"; arg="${arg# }"
+  case "$verb" in
+    h|help|'?'|shortcuts|keys) show_help ;;
+    q|quit|exit)   cleanup ;;
+    compact)       [ -n "$t" ] && { send_message "${R_TTY[$t]}" "/compact"; CMD_MSG="/compact → session $t"; last_data=0; } ;;
+    clear)         [ -n "$t" ] && { send_message "${R_TTY[$t]}" "/clear";   CMD_MSG="/clear → session $t";   last_data=0; } ;;
+    model)         [ -n "$t" ] && [ -n "$arg" ] && { send_message "${R_TTY[$t]}" "/model $arg"; CMD_MSG="/model $arg → session $t"; last_data=0; } ;;
+    all|broadcast) [ -n "$arg" ] && { local i; for (( i=1; i<=NROWS; i++ )); do send_message "${R_TTY[$i]}" "$arg" ""; done; focus_tab "$DASH_TTY"; CMD_MSG="broadcast to ${NROWS}"; last_data=0; } ;;
+    attach|jump)   [ -n "$arg" ] && t="$arg"; [ -n "$t" ] && focus_tab "${R_TTY[$t]}" ;;
+    refresh|r)     last_data=0; CMD_MSG="refreshed" ;;
+    kill)
+      [ -n "$arg" ] && t="$arg"
+      if [ -n "$t" ] && [ -n "${R_PID[$t]}" ]; then
+        prompt_line "${CORAL}kill session ${t} (${R_PROJ[$t]}, pid ${R_PID[$t]})? type 'y':${RST} "
+        case "$REPLY_LINE" in y|Y|yes) kill "${R_PID[$t]}" 2>/dev/null && CMD_MSG="killed session $t (pid ${R_PID[$t]})"; last_data=0 ;; *) CMD_MSG="kill cancelled" ;; esac
+      fi ;;
+    *)             CMD_MSG="unknown command: $verb  (try :help)" ;;
+  esac
+}
+
+# ── voice ─────────────────────────────────────────────────────────────────────
+# Speak text with macOS `say`, always in the BACKGROUND so a long briefing never
+# freezes the loop (the same non-blocking rule as the async scan). SAY_PID lets us
+# interrupt a briefing that's already talking. Newlines/pipes are flattened so the
+# whole thing is one utterance.
+speak() {
+  stop_speech
+  local t; t=$(printf '%s' "$1" | tr '\n|' '  ')
+  [ -n "$t" ] || return
+  say -v "$VOICE" -r "$SPEECH_RATE" "$t" >/dev/null 2>&1 &
+  SAY_PID=$!
+}
+stop_speech() { [ -n "$SAY_PID" ] && kill "$SAY_PID" 2>/dev/null; SAY_PID=""; }
+speaking() { [ -n "$SAY_PID" ] && kill -0 "$SAY_PID" 2>/dev/null; }
+
+# Compose a natural, speech-friendly summary of the fleet from the parsed R_*
+# arrays (populated by parse_rows). Deterministic, instant, offline — mirrors the
+# counts in render_header but as spoken sentences. "acme/webapp · financing"
+# reads better as "acme webapp, financing", so slashes/dots/dashes soften to
+# spaces and the "· name" becomes ", name".
+say_name() { # say_name <idx> -> spoken "project, name"
+  local p="${R_PROJ[$1]}"; [ "$p" = "~" ] && p="home"
+  local s="$p"; [ -n "${R_NAME[$1]}" ] && s+=", ${R_NAME[$1]}"
+  printf '%s' "$s" | tr '/_.-' '    ' | sed 's/  */ /g; s/ *, */, /g'
+}
+briefing_text() {
+  local i need=() work=() idle_n=0 ctx_total=0
+  for (( i=1; i<=NROWS; i++ )); do
+    case "${R_STATUS[$i]}" in
+      waiting)    need+=("$(say_name "$i")") ;;
+      busy|shell) work+=("$i") ;;
+      *)          idle_n=$((idle_n+1)) ;;
+    esac
+    case "${R_CTX[$i]}" in ''|*[!0-9]*) ;; *) ctx_total=$(( ctx_total + R_CTX[$i] )) ;; esac
+  done
+
+  local out=""
+  if [ "${#need[@]}" -gt 0 ]; then
+    if [ "${#need[@]}" -eq 1 ]; then out+="One session needs you: ${need[0]}. "
+    else
+      local list; printf -v list '%s; ' "${need[@]}"; list="${list%; }"
+      out+="${#need[@]} sessions need you: ${list}. "
+    fi
+  fi
+  if [ "${#work[@]}" -gt 0 ]; then
+    if [ "${#work[@]}" -eq 1 ]; then
+      local w="${work[0]}" tool="${R_TOOL[$w]##*__}"
+      out+="One working: $(say_name "$w")"; [ -n "$tool" ] && out+=", running $tool"
+      out+=". "
+    else out+="${#work[@]} sessions working. "; fi
+  fi
+  [ "$idle_n" -gt 0 ] && out+="${idle_n} idle. "
+  out+="Total context $(fmt_tok "$ctx_total" | sed 's/M/ million/; s/k/ thousand/') tokens."
+  [ -n "${need[*]}${work[*]}" ] || out="All quiet — nothing needs you. ${out}"
+  printf '%s' "$out"
+}
+
+# `a` — ask a free-form question about the fleet. Reads the question at the input
+# bar (dictate it with Wispr Flow, or type), then answers with Claude in the
+# BACKGROUND — claude -p takes several seconds and running it inline would freeze
+# the loop (the bug class we fixed with the async scan). The loop speaks the answer
+# when the job finishes. Context = one line per session (status, tool, context,
+# what it was last asked) so Claude can reason about the whole fleet.
+ask() {
+  prompt_line "${CYAN}🎤${FR} ${BRIGHT}ask about your fleet ${FAINT}(dictate or type):${RST} "
+  local q="$REPLY_LINE"; [ -n "$q" ] || return
+  local ctx="" i
+  for (( i=1; i<=NROWS; i++ )); do
+    ctx+="[$i] ${R_PROJ[$i]}"; [ -n "${R_NAME[$i]}" ] && ctx+=" (${R_NAME[$i]})"
+    ctx+=" — ${R_STATUS[$i]}"; [ -n "${R_TOOL[$i]}" ] && ctx+=", tool ${R_TOOL[$i]##*__}"
+    ctx+=", ctx $(fmt_tok "${R_CTX[$i]:-0}"), ${R_MODEL[$i]}, active ${R_AGE[$i]}"
+    [ -n "${R_ASK[$i]}" ] && ctx+=$'\n'"    last ask: ${R_ASK[$i]}"
+    ctx+=$'\n'
+  done
+  local prompt="You are a status assistant for a developer running many parallel Claude Code coding sessions. Answer the question conversationally and briefly (2-4 sentences), phrased to be spoken aloud — no markdown, no lists, no code blocks. Current fleet:
+
+${ctx}
+Question: ${q}"
+  ASK_OUT=$(mktemp -t claude-dash-ask 2>/dev/null || echo "/tmp/claude-dash-ask.$$")
+  ASK_ERR="$ASK_OUT.err"
+  # Claude Code normally authenticates with your logged-in subscription. A stub or
+  # stale ANTHROPIC_API_KEY in the environment overrides that and makes `claude -p`
+  # fail with "valid API key" — so drop an implausibly-short key for this call and
+  # let it use the subscription. A real key (>=40 chars) is left untouched.
+  if [ -n "$ANTHROPIC_API_KEY" ] && [ "${#ANTHROPIC_API_KEY}" -lt 40 ]; then
+    env -u ANTHROPIC_API_KEY claude -p "$prompt" >"$ASK_OUT" 2>"$ASK_ERR" &
+  else
+    claude -p "$prompt" >"$ASK_OUT" 2>"$ASK_ERR" &
+  fi
+  ASK_PID=$!; ASKING=1
+}
+
+# ── key reader ──────────────────────────────────────────────────────────────
+# Normalizes a single keypress (incl. arrow escape sequences) into $KEY.
+# Blocks up to $REFRESH seconds, then returns empty (a refresh tick).
+read_key() {
+  local k rest
+  if IFS= read -rsn1 -t "$REFRESH" k; then
+    # Enter is an empty read in canonical mode, but a raw CR (\r) or LF (\n) once
+    # the tty is in non-canonical mode — treat all three as ENTER.
+    if [ -z "$k" ] || [ "$k" = $'\r' ] || [ "$k" = $'\n' ]; then KEY="ENTER"; return; fi
+    case "$k" in
+      $'\033')
+        IFS= read -rsn2 -t 1 rest
+        case "$rest" in
+          '[A'|'OA') KEY="UP" ;;   '[B'|'OB') KEY="DOWN" ;;   # OA/OB: app-cursor mode
+          '[C'|'OC') KEY="RIGHT" ;; '[D'|'OD') KEY="LEFT" ;;
+          *)         KEY="ESC" ;;
+        esac ;;
+      $'\t') KEY="TAB" ;;
+      *) KEY="$k" ;;
+    esac
+  else
+    KEY=""   # timeout / refresh tick
+  fi
+}
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+if [ "$1" = "--once" ]; then
+  SEL_SID=""; TOP_IDX=1
+  compute_geometry
+  ROWS=$(collect); parse_rows; resolve_selection
+  render
+  printf '%s' "$FRAME"
+  exit 0
+fi
+
+# --mock reproduces the design-2b reference scenario (the handoff PNG) with
+# fixed data, so the UI can be eyeballed against the spec without live sessions.
+if [ "$1" = "--mock" ]; then
+  TOP_IDX=1
+  : "${DASH_COLS:=104}" "${DASH_LINES:=29}"
+  compute_geometry
+  # the reference PNG is a compact card that shows BOTH the idle-overflow
+  # collapse and the peek pane — a combination no single live terminal height
+  # produces. Pin that illustrative layout: 6 rows visible, 4 collapsed, peek on.
+  SHOW_PEEK=1; ROW_H=2; TABLE_CAP=13
+  # a tiny fake transcript so the needs-you peek has a body line to tail
+  MOCK_TRANS="$(mktemp -t claude-dash-mock).jsonl"
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"✱ To clean the build I need to remove node_modules and reinstall."}]}}' >"$MOCK_TRANS"
+  trap 'rm -f "$MOCK_TRANS"' EXIT
+  R_STATUS=(_ waiting busy    busy    idle    idle    idle    idle idle idle idle)
+  R_TTY=(_    -       -       -       -       -       -       -    -    -    -)
+  R_SID=(_    s1      s2      s3      s4      s5      s6      s7   s8   s9   s10)
+  R_TRANS=(_  "$MOCK_TRANS" "" "" "" "" "" "" "" "" "")
+  R_PROJ=(_   "~"     "acme" "webapp" "blog" "clientwork" "~" "labs" "widgets" "oss" "sandbox")
+  R_AGE=(_    "4s"    "21s"   "8s"    "2m"    "1d"    "5d"    "6d" "8d" "9d" "12d")
+  R_NAME=(_   "claude-dash" "recover-brand-guidelines" "contract-draft" "build-landing-page" "" "board-launch" "audit" "sales-copy" "invoice-sync" "site")
+  R_CTX=(_    191000  201000  146000  209000  305000  336000  88000 120000 64000 150000)
+  R_MODEL=(_  "opus-4.8" "fable-5" "opus-4.8" "opus-4.8" "opus-4.8" "fable-5" "opus-4.8" "fable-5" "opus-4.8" "fable-5")
+  R_TOOL=(_   "Bash"  "Bash"  "Edit"  "" "" "" "" "" "" "")
+  R_TARG=(_   "rm -rf node_modules && npm install" "" "" "" "" "" "" "" "" "")
+  R_STALE=(_  0       0       0       0       1       1       1    1    1    1)
+  R_REASON=(_ "" "" "" "" "" "" "" "" "" "")
+  R_ASK=(_    "To clean the build I need to remove node_modules and reinstall." "" "" "" "" "" "" "" "" "")
+  NROWS=10; SEL_SID="s1"; resolve_selection
+  render
+  printf '%s' "$FRAME"
+  exit 0
+fi
+
+DASH_TTY=$(tty 2>/dev/null); DASH_TTY="${DASH_TTY#/dev/}"
+SEL_SID=""; TOP_IDX=1; GOTO=""
+PREV_NEED=0; CMD_MSG=""
+
+# Full-screen shortcuts panel — stays up until a key is pressed (a one-frame
+# flash in the input bar was too fast to read and got truncated).
+show_help() {
+  local c="$CYAN" m="$MUTED" k="$CYAN$B" d="$MUTED"
+  printf '\033[H\033[2J%s' "$BG_MAIN"
+  local L=()
+  L+=("")
+  L+=("  ${AMBER}${B}⚡ CLAUDE CODE — shortcuts${BOFF}${FR}")
+  L+=("")
+  L+=("  ${m}navigate${FR}")
+  L+=("    ${k}↑ ↓${FR}${d}  or ${k}j k${FR}${d}   move selection — the view scrolls, the peek follows${FR}")
+  L+=("    ${k}tab${FR}${d}         next session that needs you${FR}")
+  L+=("    ${k}digits${FR}${d}      type a row number to jump to its tab — ${k}⏎${d} confirms 1–9${FR}")
+  L+=("    ${k}⏎${FR}${d}           jump to the typed row, else attach to the selection${FR}")
+  L+=("")
+  L+=("  ${m}act${FR}")
+  L+=("    ${k}y${FR}${d} / ${k}n${FR}${d}       approve / deny the permission prompt${FR}")
+  L+=("    ${k}s${FR}${d}           send an instruction (queues if the session is busy)${FR}")
+  L+=("    ${k}b${FR}${d}           broadcast one instruction to all sessions${FR}")
+  L+=("    ${k}v${FR}${d}           speak a status briefing (again / esc to stop)${FR}")
+  L+=("    ${k}a${FR}${d}           ask about the fleet by voice (dictate) or text${FR}")
+  L+=("    ${k}:${FR}${d}           command mode${FR}")
+  L+=("    ${k}q${FR}${d}           quit the dashboard (sessions keep running)${FR}")
+  L+=("")
+  L+=("  ${m}: commands${FR}  ${d}(target = selected row, or a number)${FR}")
+  L+=("    ${c}:compact${FR}${d}  ${c}:clear${FR}${d}  ${c}:model <m>${FR}${d}  ${c}:all <msg>${FR}${d}  ${c}:attach [N]${FR}")
+  L+=("    ${c}:kill [N]${FR}${d}  ${c}:refresh${FR}${d}  ${c}:quit${FR}${d}  ${c}:help${FR}")
+  L+=("")
+  L+=("  ${FAINT}press any key to return${FR}")
+  local ln
+  for ln in "${L[@]}"; do printf '%s %s\033[K\r\n' "$BG_MAIN" "$ln"; done
+  printf '%s\033[J' "$BG_MAIN"
+  IFS= read -rsn1 -t 60 _
+}
+
+cleanup() {
+  [ -n "$SCAN_PID" ] && kill "$SCAN_PID" 2>/dev/null      # stop any background scan
+  [ -n "$ASK_PID" ]  && kill "$ASK_PID" 2>/dev/null       # stop any background ask
+  [ -n "$SAY_PID" ]  && kill "$SAY_PID" 2>/dev/null       # stop any speech
+  [ -n "$SCAN_TMP" ] && rm -f "$SCAN_TMP" 2>/dev/null
+  [ -n "$ASK_OUT" ]  && rm -f "$ASK_OUT" "$ASK_ERR" 2>/dev/null
+  [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null   # restore line discipline
+  printf '\033[?25h\033[?7h\033[0m\033[?1049l'; exit 0
+}
+trap cleanup INT TERM
+# On resize just flag it: the interrupted read drops us back to the loop, which
+# recomputes geometry and hard-clears (in-place overwrite can't be trusted after
+# the terminal reflows the old frame).
+RESIZED=0
+trap 'RESIZED=1' WINCH
+
+# Switch to the ALTERNATE screen buffer (?1049h): it has no scrollback, so a
+# window resize just clips instead of reflowing old frames into scrollback
+# garbage — and quitting restores whatever was on the shell before. Hide the
+# cursor, DISABLE line-wrap (?7l), paint the canvas, clear once. Line-wrap must
+# stay off: a full-width line that reaches the last column would otherwise
+# auto-wrap to a new row and push the whole frame down on every refresh.
+printf '\033[?1049h\033[?25l\033[?7l%s\033[2J' "$BG_MAIN"
+# Put the terminal in non-canonical, no-echo mode for the whole session (restored
+# in cleanup). Without this, bash's `read -n1` only flips to cbreak for the
+# duration of each read and restores canonical (line-buffered) mode in between —
+# so a second digit typed while the frame is rendering (e.g. the "4" of a quick
+# "14") lands in the canonical line buffer and is dropped by the next read. That
+# made two-digit row jumps fail unless you paused between the digits. `min 1
+# time 0` = each read blocks until at least one byte is available.
+STTY_SAVE=$(stty -g 2>/dev/null)
+stty -icanon -echo min 1 time 0 2>/dev/null
+# The session scan (collect: a jq pass per live session) costs ~1s and grows with
+# the fleet — several seconds with a dozen-plus sessions. Running it inline froze
+# ALL key input for its whole duration: after you typed the first digit of a
+# two-digit jump, the scan blocked the loop and swallowed the second digit before
+# it could be read, so "14" never reached row 14 (and navigation felt sluggish).
+# Fix: run collect in the BACKGROUND (stdout -> a tmpfile, stdin from /dev/null so
+# it can't grab your keystrokes). The loop kicks off a scan when one is due, keeps
+# rendering and reading keys while it runs, and folds in the fresh data the moment
+# the background job finishes. Key input is never blocked by a scan again.
+DATA_INTERVAL=2
+SCAN_TMP=$(mktemp -t claude-dash-scan 2>/dev/null || echo "/tmp/claude-dash-scan.$$")
+# initial scan is synchronous so the first frame already shows the fleet
+ROWS=$(collect </dev/null 2>/dev/null); parse_rows; resolve_selection
+now=$(date +%s); last_data=$now; SCAN_PID=""; SCANNING=0
+SAY_PID=""; ASK_PID=""; ASKING=0; ANSWER=""; ASK_OUT=""; ASK_ERR=""
+PREV_COLS=0; PREV_LINES=0
+while true; do
+  compute_geometry
+  # After a resize the terminal has reflowed the old frame, so overwriting in
+  # place leaves fragments of the old layout behind — wipe the slate first.
+  if [ "$RESIZED" = 1 ] || [ "$COLS_T" != "$PREV_COLS" ] || [ "$LINES_T" != "$PREV_LINES" ]; then
+    RESIZED=0; PREV_COLS=$COLS_T; PREV_LINES=$LINES_T
+    printf '%s\033[2J' "$BG_MAIN"
+  fi
+  now=$(date +%s)
+  # fold in a finished background scan
+  if [ "$SCANNING" = 1 ] && ! kill -0 "$SCAN_PID" 2>/dev/null; then
+    SCANNING=0; last_data=$now
+    ROWS=$(cat "$SCAN_TMP" 2>/dev/null); parse_rows; resolve_selection
+    # ring the bell + note when a new session flips to needs-you
+    local_need=0; i=1
+    while [ $i -le "$NROWS" ]; do [ "${R_STATUS[$i]}" = waiting ] && local_need=$((local_need+1)); i=$((i+1)); done
+    if [ "$BELL" = 1 ] && [ "$local_need" -gt "$PREV_NEED" ]; then printf '\a'; fi
+    PREV_NEED=$local_need
+  fi
+  # kick off a new background scan when due and none is running
+  if [ "$SCANNING" = 0 ] && [ $(( now - last_data )) -ge "$DATA_INTERVAL" ]; then
+    collect </dev/null >"$SCAN_TMP" 2>/dev/null &
+    SCAN_PID=$!; SCANNING=1
+  fi
+  # fold in a finished background "ask" (claude -p) -> speak the answer
+  if [ "$ASKING" = 1 ] && ! kill -0 "$ASK_PID" 2>/dev/null; then
+    ASKING=0; ANSWER=$(cat "$ASK_OUT" 2>/dev/null)
+    if [ -n "$ANSWER" ]; then speak "$ANSWER"
+    else
+      ask_err=$(tr '\n' ' ' <"$ASK_ERR" 2>/dev/null | sed 's/  */ /g')
+      CMD_MSG="ask failed: ${ask_err:-no output (is 'claude' on PATH?)}"
+    fi
+    rm -f "$ASK_OUT" "$ASK_ERR" 2>/dev/null
+  fi
+
+  render
+  # Home the cursor and overwrite in place. Clamp to the terminal height (head)
+  # and drop the trailing newline: printing a newline on the last row — or any
+  # line past the last row — scrolls the screen, which would march the whole
+  # dashboard upward every tick. The clamp also guards against an unusually tall
+  # frame (e.g. many simultaneously-active rows on a short terminal).
+  printf '\033[H%s%s\033[J%s' "$(printf '%s' "$FRAME" | head -n "$LINES_T")" "$BG_MAIN" "$RST"
+
+  read_key
+  # Any key other than a digit, ⏎, esc, or a refresh tick cancels a pending
+  # "go to session" number so it can't leak into the next action.
+  case "$KEY" in [0-9]|ENTER|ESC|'') ;; *) GOTO="" ;; esac
+  case "$KEY" in
+    UP|k)    move_sel -1 ;;
+    DOWN|j)  move_sel +1 ;;
+    TAB)     next_alert ;;
+    [0-9])
+      # Build a row number across keystrokes and show it live in the input bar.
+      # There's no blocking read and no timeout, so "14" always goes to 14 no
+      # matter how fast or slow you type, and a lone lead digit never yanks you
+      # to the wrong tab. Ignore a leading zero (no row 0) and any digit that
+      # would overshoot NROWS. Jump the instant the number can't grow to another
+      # valid row (e.g. "14" when the fleet has 16 rows); otherwise wait for the
+      # next digit or ⏎.
+      if [ -n "$GOTO" ] || [ "$KEY" != 0 ]; then
+        gnew="${GOTO}${KEY}"; g=$(( 10#$gnew ))
+        if [ "$g" -le "$NROWS" ]; then
+          GOTO="$gnew"
+          if [ $(( g * 10 )) -gt "$NROWS" ]; then focus_tab "${R_TTY[$g]}"; GOTO=""; fi
+        fi
+      fi
+      ;;
+    ENTER)
+      if [ -n "$GOTO" ]; then
+        g=$(( 10#$GOTO )); GOTO=""
+        [ "$g" -ge 1 ] && [ "$g" -le "$NROWS" ] && focus_tab "${R_TTY[$g]}"
+      elif [ -n "$SEL_IDX" ]; then focus_tab "${R_TTY[$SEL_IDX]}"; fi ;;
+    ESC)     GOTO=""; stop_speech ;;
+    y|Y)     [ -n "$SEL_IDX" ] && [ "${R_STATUS[$SEL_IDX]}" = waiting ] \
+               && { answer_prompt "${R_TTY[$SEL_IDX]}" approve; last_data=0; } ;;
+    n|N)     [ -n "$SEL_IDX" ] && [ "${R_STATUS[$SEL_IDX]}" = waiting ] \
+               && { answer_prompt "${R_TTY[$SEL_IDX]}" deny; last_data=0; } ;;
+    v|V)     if speaking; then stop_speech; else ANSWER="$(briefing_text)"; speak "$ANSWER"; fi ;;
+    a|A)     ask ;;
+    s|S)     focus_input ;;
+    b|B)     broadcast ;;
+    ':')     command_mode ;;
+    '?')     show_help ;;
+    q|Q)     cleanup ;;
+  esac
+done
