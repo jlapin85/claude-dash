@@ -12,16 +12,18 @@ without switching windows.
 
 ```
 HEADER   brand · fleet summary (needs-you / working / idle) · total context · clock
-TABLE    one row per session: project, name, context fuel-gauge, model, age, status
+TABLE    one row per session: project, title, context fuel-gauge, model, age, status
 PEEK     the selected session's live tail — permission prompts answerable inline
 INPUT    send an instruction straight into the selected session
 ```
 
-Each project gets a stable identity color so you can pick it out of the table
-at a glance. Context per session renders as a thin fuel gauge — green while
-healthy, amber as it gets pricey, coral when it's time to compact. Sessions
-whose transcript started long ago get a dim `stale` marker (marathon sessions
-bloat context and cost).
+Each row is titled with what that session is actually about, taken from the
+conversation's own title; a name you set yourself (`/name`, a launcher script)
+wins over it. Each project gets a stable identity color so you can pick it out
+of the table at a glance. Context per session renders as a thin fuel gauge —
+green while healthy, amber as it gets pricey, coral when it's time to compact.
+Sessions whose transcript started long ago get a dim `stale` marker (marathon
+sessions bloat context and cost).
 
 ## Keys
 

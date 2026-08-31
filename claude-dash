@@ -112,20 +112,37 @@ last_ask() {
     select(startswith("Caveat")|not)' 2>/dev/null | tail -1
 }
 
-# One pass over the transcript tail -> "model|context|tool|toolarg".
+# The conversation's own title ("Pitch follow-up emails"), from the transcript's
+# most recent `ai-title` record — Claude Code rewrites one every few turns, so a
+# tail read always finds a current one. This is the only place a *descriptive*
+# session title survives: the state file's .name is now an auto-generated slug
+# (see collect()). Same tail-then-grep shape as last_ask() — never scan a
+# multi-megabyte transcript in the refresh loop.
+session_title() {
+  local transcript="$1"
+  [ -f "$transcript" ] || return
+  tail -c 2000000 "$transcript" 2>/dev/null | grep -h '"ai-title"' | tail -1 \
+    | jq -r '.aiTitle // empty' 2>/dev/null
+}
+
+# One pass over the transcript tail -> "model|context|tool|toolarg|title".
 # Context is the full prompt size of the most recent API call (input + cache
 # read + cache creation) — the tokens re-sent every turn. /compact writes a
 # compact_boundary carrying the post-compaction size WITHOUT a new usage record,
 # so a compaction newer than the last usage line supersedes it. toolarg is the
-# file/command the current tool is acting on, for the working sub-line.
+# file/command the current tool is acting on, for the working sub-line. title is
+# the newest ai-title in the window — free here, since these lines are already
+# being read; collect() falls back to session_title() when the window misses one.
 session_stats() {
   local transcript="$1"
-  [ -f "$transcript" ] || { printf '|||'; return; }
+  [ -f "$transcript" ] || { printf '||||'; return; }
   tail -n 400 "$transcript" 2>/dev/null | jq -Rrs '
     [ split("\n")[] | fromjson? // empty ] as $all |
     ($all | map(select(.type=="assistant"))) as $a |
     ($a | map(select(.message.usage != null)) | last) as $u |
     ($all | map(select(.type=="system" and .subtype=="compact_boundary")) | last) as $c |
+    (($all | map(select(.type=="ai-title") | .aiTitle) | last // "")
+     | gsub("[|\n\t]"; " ") | gsub("\\s+"; " ")) as $title |
     ($a | map(.message.content? | select(type=="array") | .[]
               | select(.type=="tool_use")) | last) as $lu |
     ($lu.name // "") as $tool |
@@ -141,7 +158,7 @@ session_stats() {
     (if ($c != null) and (($c.timestamp // "") > ($u.timestamp // ""))
         then ($c.compactMetadata.postTokens // $utot)
      else $utot end) as $ctx |
-    "\($model)|\($ctx // "")|\($tool)|\($targ)"' 2>/dev/null || printf '|||'
+    "\($model)|\($ctx // "")|\($tool)|\($targ)|\($title)"' 2>/dev/null || printf '||||'
 }
 
 # Is this session a marathon? True iff the transcript's FIRST line carries a
@@ -300,10 +317,12 @@ APPLESCRIPT
 #   status|tty|pid|sid|transcript|project|age|name|ctx|model|tool|toolarg|reason|ask
 collect() {
   local rows=""
-  # tty -> pinned-tab-title map, resolved once per scan. Strip the /dev/ prefix
-  # (so entries compare against `ps -o tty=` output) and Claude Code's status
-  # glyphs (✳/⠂ etc.) off the front of titles it pinned itself.
-  local tabmap; tabmap=$(tab_titles | sed -e 's|^/dev/||' -e $'s/\t[^a-zA-Z0-9]*/\t/')
+  # tty -> pinned-tab-title map (the /dev/ prefix stripped so entries compare
+  # against `ps -o tty=` output, and Claude Code's status glyphs ✳/⠂ trimmed off
+  # the titles it pinned itself). osascript costs ~0.4s, and titles now come from
+  # the transcript, so resolve this lazily — on the first session that actually
+  # falls through to it, at most once per scan.
+  local tabmap="" tabmap_done=0
   for f in "$SESSIONS_DIR"/*.json; do
     [ -f "$f" ] || continue
     local pid; pid=$(basename "$f" .json)
@@ -322,17 +341,6 @@ collect() {
     # throws off the digit-jump numbering. Skip it.
     case "$tty" in ''|'??') continue ;; esac
 
-    # Name fallback: no .name in the state file -> the session's pinned Terminal
-    # tab title (strip '|' so a title can't break the row format).
-    if [ -z "$name" ] && [ -n "$tabmap" ]; then
-      name=$(printf '%s\n' "$tabmap" | awk -F'\t' -v t="$tty" '$1==t{print $2; exit}' | tr -d '|')
-    fi
-    # Still no name (no .name, no pinned tab title) -> the terminal id, so several
-    # unnamed sessions in the same project (e.g. eight in acme/webapp) don't
-    # render as identical, indistinguishable rows. The tty is also what a jump
-    # targets, so it's a useful thing to show.
-    [ -z "$name" ] && name="$tty"
-
     local project
     case "$cwd" in
       "$HOME/projects/"*) project="${cwd#"$HOME"/projects/}" ;;
@@ -341,11 +349,41 @@ collect() {
     esac
 
     local transcript="$PROJECTS_DIR/$(echo "$cwd" | sed 's/[\/._]/-/g')/$sid.jsonl"
-    local ask; ask=$(last_ask "$transcript" | tr '\n\t|' '   ' | sed 's/  */ /g')
-    local stats model ctx tool targ
+
+    local stats model ctx tool targ title
     stats=$(session_stats "$transcript")
-    IFS='|' read -r model ctx tool targ <<<"$stats"
+    IFS='|' read -r model ctx tool targ title <<<"$stats"
     model=$(short_model "$model")
+
+    # Claude Code auto-fills .name with a slug of the cwd plus a short hex tag
+    # ("joseph-lapin-0a") — near-identical for every session in a project, so the
+    # column stopped saying anything about the work. Treat that shape as no name
+    # at all and use the conversation's own title instead. A .name that doesn't
+    # match the slug shape is a real one (set by /name or a launcher) and still
+    # wins: it's what the human chose to call this session.
+    local base slug; base=$(basename "$cwd"); slug="${base//[^a-zA-Z0-9]/-}"
+    # Match the full generated shape (slug + a short all-hex tag), not a prefix,
+    # so a hand-picked "ziplines-api" survives while "ziplines-6f" doesn't.
+    [[ "$name" =~ ^${slug}-[0-9a-f]{2,8}$ ]] && name=""
+    [ -z "$name" ] && name="$title"
+    # No title in the stats window (a long tool burst can push it out) -> read
+    # deeper for one.
+    [ -z "$name" ] && name=$(session_title "$transcript" | tr -d '|')
+    # Still nothing -> the session's pinned Terminal tab title (strip '|' so a
+    # title can't break the row format).
+    if [ -z "$name" ]; then
+      if [ "$tabmap_done" = 0 ]; then
+        tabmap=$(tab_titles | sed -e 's|^/dev/||' -e $'s/\t[^a-zA-Z0-9]*/\t/'); tabmap_done=1
+      fi
+      [ -n "$tabmap" ] &&
+        name=$(printf '%s\n' "$tabmap" | awk -F'\t' -v t="$tty" '$1==t{print $2; exit}' | tr -d '|')
+    fi
+    # Last resort (untitled, unpinned session) -> the terminal id, so several
+    # unnamed sessions in the same project (e.g. eight in acme/webapp) don't
+    # render as identical, indistinguishable rows. The tty is also what a jump
+    # targets, so it's a useful thing to show.
+    [ -z "$name" ] && name="$tty"
+    local ask; ask=$(last_ask "$transcript" | tr '\n\t|' '   ' | sed 's/  */ /g')
     local stale=0; session_is_stale "$transcript" && stale=1
 
     local order
