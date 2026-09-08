@@ -1,6 +1,6 @@
 #!/bin/bash
 # claude-relaunch — snapshot every running Claude Code session, and after a
-# reboot reopen each one in its own Terminal.app tab with `claude --resume`.
+# reboot reopen each one in its own Terminal.app window with `claude --resume`.
 #
 #   claude-relaunch save     snapshot live sessions -> ~/.claude/relaunch/manifest.json
 #   claude-relaunch list     show what the manifest would reopen
