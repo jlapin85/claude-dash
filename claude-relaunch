@@ -1,0 +1,98 @@
+#!/bin/bash
+# claude-relaunch — snapshot every running Claude Code session, and after a
+# reboot reopen each one in its own Terminal.app tab with `claude --resume`.
+#
+#   claude-relaunch save     snapshot live sessions -> ~/.claude/relaunch/manifest.json
+#   claude-relaunch list     show what the manifest would reopen
+#   claude-relaunch go       open one Terminal window per saved session and resume it
+#   claude-relaunch          = save if any sessions are live, otherwise go
+#
+# Data source: the per-process metadata Claude Code writes to ~/.claude/sessions/
+# (same as claude-dash). Needs jq. Windows are opened through Terminal.app's own
+# AppleScript dictionary, so no Accessibility permission is required.
+
+set -u
+SESS_DIR="$HOME/.claude/sessions"
+OUT_DIR="$HOME/.claude/relaunch"
+MANIFEST="$OUT_DIR/manifest.json"
+PAUSE="${CLAUDE_RELAUNCH_PAUSE:-1.5}"   # seconds between windows
+
+die() { printf 'claude-relaunch: %s\n' "$*" >&2; exit 1; }
+command -v jq >/dev/null || die "jq not found (brew install jq)"
+
+# First real user prompt in a transcript, for a human-readable title.
+title_for() {  # $1=cwd $2=sessionId
+  local enc t
+  enc=$(printf '%s' "$1" | sed 's#/#-#g')
+  t="$HOME/.claude/projects/$enc/$2.jsonl"
+  [ -f "$t" ] || { echo ""; return; }
+  grep '"type":"user"' "$t" 2>/dev/null \
+    | jq -r '.message.content | if type=="string" then . else (map(select(.type=="text")|.text)|join(" ")) end' 2>/dev/null \
+    | grep -v -e '^[[:space:]]*<' -e '^[[:space:]]*$' \
+    | head -1 | tr '\n\t' '  ' | cut -c1-80
+}
+
+do_save() {
+  mkdir -p "$OUT_DIR"
+  local n=0 rows=()
+  for f in "$SESS_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    local pid sid cwd name kind
+    pid=$(jq -r '.pid // empty' "$f"); [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue              # only live sessions
+    kind=$(jq -r '.kind // "interactive"' "$f")
+    [ "$kind" = "interactive" ] || continue
+    sid=$(jq -r '.sessionId' "$f"); cwd=$(jq -r '.cwd' "$f"); name=$(jq -r '.name // ""' "$f")
+    [ -d "$cwd" ] || cwd="$HOME"
+    rows+=("$(jq -n --arg s "$sid" --arg c "$cwd" --arg n "$name" --arg t "$(title_for "$cwd" "$sid")" \
+             '{sessionId:$s,cwd:$c,name:$n,title:$t}')")
+    n=$((n+1))
+  done
+  [ "$n" -gt 0 ] || die "no live Claude Code sessions found"
+  if [ -f "$MANIFEST" ]; then cp "$MANIFEST" "$OUT_DIR/manifest.prev.json"; fi
+  printf '%s\n' "${rows[@]}" | jq -s --arg at "$(date '+%Y-%m-%d %H:%M:%S')" '{savedAt:$at,sessions:.}' > "$MANIFEST"
+  echo "saved $n session(s) -> $MANIFEST"
+  do_list
+}
+
+do_list() {
+  [ -f "$MANIFEST" ] || die "no manifest yet — run: claude-relaunch save"
+  jq -r '"saved \(.savedAt)"' "$MANIFEST"
+  jq -r '.sessions | to_entries[] | "\(.key+1|tostring|.+".  "|.[0:4]) \(.value.cwd|sub("^"+env.HOME;"~"))\n      \(.value.title // "")"' "$MANIFEST"
+}
+
+do_go() {
+  [ -f "$MANIFEST" ] || die "no manifest yet — run: claude-relaunch save"
+  local count; count=$(jq '.sessions|length' "$MANIFEST")
+  echo "reopening $count session(s), one Terminal window each…"
+  osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1
+  local i=0
+  while IFS=$'\t' read -r sid cwd name; do
+    i=$((i+1))
+    local cmd title short
+    short="${cwd/#$HOME/~}"
+    title="${name:-claude} · $short"
+    cmd=$(printf "cd %q && claude --resume %s" "$cwd" "$sid")
+    # Terminal's own dictionary only — no System Events / Accessibility needed.
+    osascript >/dev/null 2>&1 <<APPLESCRIPT
+tell application "Terminal"
+  set t to do script "$cmd"
+  set custom title of t to "$title"
+end tell
+APPLESCRIPT
+    printf '  %2d/%d  %-28s %s\n' "$i" "$count" "$name" "$short"
+    sleep "$PAUSE"
+  done < <(jq -r '.sessions[] | [.sessionId,.cwd,(.name//"")] | @tsv' "$MANIFEST")
+  echo "done — each window is resuming its session (Window > Merge All Windows to make them tabs)."
+}
+
+case "${1:-auto}" in
+  save) do_save ;;
+  list) do_list ;;
+  go)   do_go ;;
+  auto)
+    live=0; for f in "$SESS_DIR"/*.json; do [ -f "$f" ] || continue; p=$(jq -r '.pid // empty' "$f"); [ -n "$p" ] && kill -0 "$p" 2>/dev/null && live=$((live+1)); done
+    if [ "$live" -gt 0 ]; then do_save; else do_go; fi ;;
+  -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command '$1' (save | list | go)" ;;
+esac
