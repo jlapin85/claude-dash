@@ -1,10 +1,11 @@
 #!/bin/bash
 # claude-relaunch — snapshot every running Claude Code session, and after a
-# reboot reopen each one in its own Terminal.app window with `claude --resume`.
+# reboot reopen each one as a TAB of one Terminal.app window with `claude --resume`.
 #
 #   claude-relaunch save     snapshot live sessions -> ~/.claude/relaunch/manifest.json
 #   claude-relaunch list     show what the manifest would reopen
-#   claude-relaunch go       open one Terminal window per saved session and resume it
+#   claude-relaunch go       reopen every saved session as a tab in one Terminal window
+#                            (set CLAUDE_RELAUNCH_WINDOWS=1 for the old one-window-each)
 #   claude-relaunch          = save if any sessions are live, otherwise go
 #
 # Data source: the per-process metadata Claude Code writes to ~/.claude/sessions/
@@ -15,7 +16,11 @@ set -u
 SESS_DIR="$HOME/.claude/sessions"
 OUT_DIR="$HOME/.claude/relaunch"
 MANIFEST="$OUT_DIR/manifest.json"
-PAUSE="${CLAUDE_RELAUNCH_PAUSE:-1.5}"   # seconds between windows
+PAUSE="${CLAUDE_RELAUNCH_PAUSE:-1.5}"   # seconds between tabs
+# Tabs work by telling Terminal to prefer tabs for windows it opens itself
+# (AppleWindowTabbingMode). Terminal reads it at launch, so `save` sets it
+# ahead of the reboot and `go` only checks it.
+TABMODE_DOMAIN=com.apple.Terminal
 
 die() { printf 'claude-relaunch: %s\n' "$*" >&2; exit 1; }
 command -v jq >/dev/null || die "jq not found (brew install jq)"
@@ -53,6 +58,7 @@ do_save() {
   printf '%s\n' "${rows[@]}" | jq -s --arg at "$(date '+%Y-%m-%d %H:%M:%S')" '{savedAt:$at,sessions:.}' > "$MANIFEST"
   echo "saved $n session(s) -> $MANIFEST"
   do_list
+  ensure_tabmode
 }
 
 do_list() {
@@ -61,12 +67,22 @@ do_list() {
   jq -r '.sessions | to_entries[] | "\(.key+1|tostring|.+".  "|.[0:4]) \(.value.cwd|sub("^"+env.HOME;"~"))\n      \(.value.title // "")"' "$MANIFEST"
 }
 
+ensure_tabmode() {
+  if [ "${CLAUDE_RELAUNCH_WINDOWS:-0}" = 1 ]; then return; fi
+  if [ "$(defaults read $TABMODE_DOMAIN AppleWindowTabbingMode 2>/dev/null)" != "always" ]; then
+    defaults write $TABMODE_DOMAIN AppleWindowTabbingMode -string always
+    echo "Terminal set to open its own new windows as tabs (takes effect next time Terminal launches)."
+  fi
+}
+
 do_go() {
   [ -f "$MANIFEST" ] || die "no manifest yet — run: claude-relaunch save"
   local count; count=$(jq '.sessions|length' "$MANIFEST")
-  echo "reopening $count session(s), one Terminal window each…"
+  ensure_tabmode
+  echo "reopening $count session(s) as tabs of this Terminal window…"
   osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1
-  local i=0
+  local i=0 win_before win_after mode=""
+  win_before=$(osascript -e 'tell application "Terminal" to count windows' 2>/dev/null || echo 0)
   while IFS=$'\t' read -r sid cwd name; do
     i=$((i+1))
     local cmd title short
@@ -74,16 +90,26 @@ do_go() {
     title="${name:-claude} · $short"
     cmd=$(printf "cd %q && claude --resume %s" "$cwd" "$sid")
     # Terminal's own dictionary only — no System Events / Accessibility needed.
+    # With AppleWindowTabbingMode=always, `do script` lands in a new tab of the front window.
     osascript >/dev/null 2>&1 <<APPLESCRIPT
 tell application "Terminal"
   set t to do script "$cmd"
   set custom title of t to "$title"
 end tell
 APPLESCRIPT
+    if [ -z "$mode" ]; then
+      sleep 0.5
+      win_after=$(osascript -e 'tell application "Terminal" to count windows' 2>/dev/null || echo 0)
+      if [ "$win_after" -gt "$win_before" ]; then mode=windows; else mode=tabs; fi
+    fi
     printf '  %2d/%d  %-28s %s\n' "$i" "$count" "$name" "$short"
     sleep "$PAUSE"
   done < <(jq -r '.sessions[] | [.sessionId,.cwd,(.name//"")] | @tsv' "$MANIFEST")
-  echo "done — each window is resuming its session (Window > Merge All Windows to make them tabs)."
+  if [ "$mode" = windows ]; then
+    echo "done — Terminal opened windows this time (tab mode applies from its next launch). Window > Merge All Windows makes them tabs."
+  else
+    echo "done — every session is a tab of this window; Cmd-Shift-] cycles through them."
+  fi
 }
 
 case "${1:-auto}" in
