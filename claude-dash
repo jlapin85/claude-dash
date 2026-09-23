@@ -16,7 +16,7 @@
 # ~/.claude/projects/ (context size, model, current tool, recent output).
 #
 # Keys (interactive):
-#   digits  type a row number to jump to its Terminal tab (⏎ to confirm 1–9)
+#   digits  type a row number to jump to its Terminal tab / tmux window (⏎ to confirm 1–9)
 #   ↑/↓ j/k move the selection cursor (view scrolls, peek follows)
 #   ⏎       jump to the typed row, else attach to the selected session
 #   y / n   approve / deny the selected session's permission prompt (from here)
@@ -880,8 +880,20 @@ next_alert() { # cycle to the next session in waiting state
   done
 }
 
-# ── terminal actions (osascript) ────────────────────────────────────────────
+# ── terminal actions (tmux when the dash runs inside tmux, else osascript) ──
+# Inside tmux (the Mac Mini), sessions are tmux panes: match the row's tty to a
+# pane and switch windows / send keys with tmux. No Terminal.app, no Accessibility.
+tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
+  [ -n "$TMUX" ] || return 1
+  tmux list-panes -a -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+    | awk -v t="/dev/$1" '$1==t{print $2; exit}'
+}
 focus_tab() { # focus_tab <tty>
+  if [ -n "$TMUX" ]; then
+    local pane; pane=$(tmux_pane_for_tty "$1")
+    [ -n "$pane" ] && { tmux select-window -t "$pane" 2>/dev/null; tmux select-pane -t "$pane" 2>/dev/null; }
+    return
+  fi
   osascript >/dev/null 2>&1 <<EOF
 tell application "Terminal"
   activate
@@ -910,6 +922,11 @@ EOF
 }
 
 send_message() { # send_message <tty> <text> [return-tty]  ("" = don't return)
+  if [ -n "$TMUX" ]; then
+    local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
+    tmux send-keys -t "$pane" -l -- "$2"; sleep 0.15; tmux send-keys -t "$pane" Enter
+    return
+  fi
   local msg="${2//\\/\\\\}"; msg="${msg//\"/\\\"}"
   send_keys "$1" "keystroke \"$msg\"
   delay 0.15
@@ -919,6 +936,11 @@ send_message() { # send_message <tty> <text> [return-tty]  ("" = don't return)
 # Answer the selected session's permission prompt from the dashboard.
 # approve -> press 1 (approve once); deny -> Escape (cancels the prompt).
 answer_prompt() { # answer_prompt <tty> <approve|deny>
+  if [ -n "$TMUX" ]; then
+    local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
+    if [ "$2" = approve ]; then tmux send-keys -t "$pane" 1; else tmux send-keys -t "$pane" Escape; fi
+    return
+  fi
   if [ "$2" = approve ]; then
     send_keys "$1" "keystroke \"1\"" "$DASH_TTY"
   else

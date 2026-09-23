@@ -75,8 +75,26 @@ ensure_tabmode() {
   fi
 }
 
+# On the Mac Mini (tmux session "work"), reopen each session as a tmux window with
+# Remote Control instead of a Terminal.app tab.
+do_go_tmux() {
+  local count i=0; count=$(jq '.sessions|length' "$MANIFEST")
+  echo "reopening $count session(s) as windows of tmux session 'work'…"
+  while IFS=$'\t' read -r sid cwd name; do
+    i=$((i+1)); [ -n "$name" ] || name="claude-${sid:0:4}"
+    [ -d "$cwd" ] || { printf '  %2d/%d  %-28s skipped — %s missing\n' "$i" "$count" "$name" "$cwd"; continue; }
+    if tmux list-windows -t work -F '#W' | grep -qx "$name"; then
+      printf '  %2d/%d  %-28s already open\n' "$i" "$count" "$name"; continue
+    fi
+    tmux new-window -d -t work -n "$name" -c "$cwd" "claude --resume $sid --remote-control $name; zsh"
+    printf '  %2d/%d  %-28s %s\n' "$i" "$count" "$name" "${cwd/#$HOME/~}"
+  done < <(jq -r '.sessions[] | [.sessionId,.cwd,(.name//"")] | @tsv' "$MANIFEST")
+  echo "done — Ctrl-b w lists them; they are on the phone too (Remote Control)."
+}
+
 do_go() {
   [ -f "$MANIFEST" ] || die "no manifest yet — run: claude-relaunch save"
+  if command -v tmux >/dev/null && tmux has-session -t work 2>/dev/null; then do_go_tmux; return; fi
   local count; count=$(jq '.sessions|length' "$MANIFEST")
   ensure_tabmode
   echo "reopening $count session(s) as tabs of this Terminal window…"
