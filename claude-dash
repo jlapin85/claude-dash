@@ -989,6 +989,29 @@ broadcast() {
   CMD_MSG="broadcast to ${NROWS} sessions"; last_data=0
 }
 
+# `:new <project>` — start a Claude session for ~/projects/<project> (or an absolute path).
+# Inside tmux (the Mac Mini): jump to that window if it exists, else open one running
+# `claude --remote-control <name>`. Outside tmux: a new Terminal tab running claude there.
+new_session() {
+  local arg="$1" dir name
+  [ -n "$arg" ] || { CMD_MSG="usage: :new <project>   (a folder under ~/projects, or a path)"; return; }
+  case "$arg" in /*|~*) dir="${arg/#\~/$HOME}" ;; *) dir="$HOME/projects/$arg" ;; esac
+  [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
+  name="${dir##*/}"
+  if [ -n "$TMUX" ]; then
+    tmux select-window -t "work:$name" 2>/dev/null && { CMD_MSG="jumped to $name"; return; }
+    tmux new-window -t work -n "$name" -c "$dir" "claude --remote-control $name; zsh"
+    CMD_MSG="new session: $name"
+  else
+    osascript -e "tell application \"Terminal\" to activate" \
+      -e "tell application \"System Events\" to keystroke \"t\" using command down" >/dev/null 2>&1
+    sleep 0.5
+    osascript -e "tell application \"Terminal\" to do script \"cd '$dir' && claude\" in front window" >/dev/null 2>&1
+    CMD_MSG="new session: $name (new Terminal tab)"
+  fi
+  last_data=0
+}
+
 # `:` — command mode for dashboard actions. Verb + optional arg; target is the
 # selected row unless a number is given.
 command_mode() {
@@ -1004,6 +1027,7 @@ command_mode() {
     model)         [ -n "$t" ] && [ -n "$arg" ] && { send_message "${R_TTY[$t]}" "/model $arg"; CMD_MSG="/model $arg → session $t"; last_data=0; } ;;
     all|broadcast) [ -n "$arg" ] && { local i; for (( i=1; i<=NROWS; i++ )); do send_message "${R_TTY[$i]}" "$arg" ""; done; focus_tab "$DASH_TTY"; CMD_MSG="broadcast to ${NROWS}"; last_data=0; } ;;
     attach|jump)   [ -n "$arg" ] && t="$arg"; [ -n "$t" ] && focus_tab "${R_TTY[$t]}" ;;
+    new|open)      new_session "$arg" ;;
     refresh|r)     last_data=0; CMD_MSG="refreshed" ;;
     kill)
       [ -n "$arg" ] && t="$arg"
@@ -1207,7 +1231,7 @@ show_help() {
   L+=("")
   L+=("  ${m}: commands${FR}  ${d}(target = selected row, or a number)${FR}")
   L+=("    ${c}:compact${FR}${d}  ${c}:clear${FR}${d}  ${c}:model <m>${FR}${d}  ${c}:all <msg>${FR}${d}  ${c}:attach [N]${FR}")
-  L+=("    ${c}:kill [N]${FR}${d}  ${c}:refresh${FR}${d}  ${c}:quit${FR}${d}  ${c}:help${FR}")
+  L+=("    ${c}:kill [N]${FR}${d}  ${c}:new <project>${FR}${d}  ${c}:refresh${FR}${d}  ${c}:quit${FR}${d}  ${c}:help${FR}")
   L+=("")
   L+=("  ${FAINT}press any key to return${FR}")
   local ln
