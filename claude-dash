@@ -883,9 +883,13 @@ next_alert() { # cycle to the next session in waiting state
 # ── terminal actions (tmux when the dash runs inside tmux, else osascript) ──
 # Inside tmux (the Mac Mini), sessions are tmux panes: match the row's tty to a
 # pane and switch windows / send keys with tmux. No Terminal.app, no Accessibility.
+# Targets are resolved in the dash's OWN tmux session. Each laptop terminal is a
+# grouped session sharing the windows, so selecting in another session's name would
+# switch a different terminal's view and leave this one where it was.
+tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
 tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
   [ -n "$TMUX" ] || return 1
-  tmux list-panes -a -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+  tmux list-panes -s -t "$(tmux_my_session)" -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
     | awk -v t="/dev/$1" '$1==t{print $2; exit}'
 }
 focus_tab() { # focus_tab <tty>
@@ -999,8 +1003,10 @@ new_session() {
   [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
   name="${dir##*/}"
   if [ -n "$TMUX" ]; then
-    tmux select-window -t "work:$name" 2>/dev/null && { CMD_MSG="jumped to $name"; return; }
-    tmux new-window -t work -n "$name" -c "$dir" "claude --remote-control $name; zsh"
+    local me; me="$(tmux_my_session)"
+    tmux select-window -t "$me:$name" 2>/dev/null && { CMD_MSG="jumped to $name"; return; }
+    tmux new-window -d -t work -n "$name" -c "$dir" "claude --remote-control $name; zsh"
+    tmux select-window -t "$me:$name" 2>/dev/null
     CMD_MSG="new session: $name"
   else
     osascript -e "tell application \"Terminal\" to activate" \
