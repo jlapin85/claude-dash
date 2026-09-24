@@ -278,15 +278,6 @@ ctx_bar() { # ctx_bar <tokens> <model> <row-bg>
   printf '%s%s %s%-5s%s' "$out" "$rbg" "$tc" "$(fmt_tok "$tok")" "$FR"
 }
 
-ctx_tok() { # ctx_tok <tokens> <model> -> token count only (compact layouts), same tone as the bar
-  local tok="${1:-0}" pct; pct=$(ctx_pct "$tok" "$2")
-  if [ "$pct" -lt 0 ]; then printf '%s%-5s%s' "$FAINT" "—" "$FR"; return; fi
-  local tc="$STEEL"
-  [ $pct -ge $CTX_AMBER ] && tc="$AMBER"
-  [ $pct -ge $CTX_RED ]   && tc="$CORAL"
-  printf '%s%-5s%s' "$tc" "$(fmt_tok "$tok")" "$FR"
-}
-
 rel_time() { # ms epoch -> "3m", "2h", "1d"
   local ms="$1" now diff; now=$(date +%s); diff=$(( now - ms / 1000 ))
   if   [ "$diff" -lt 60 ];    then echo "${diff}s"
@@ -527,13 +518,6 @@ emit_border() { # emit_border <top|bottom>
 # Colorize one status cell for a row.
 status_cell() { # status_cell <status> <tool> <age> <blink>
   local s="$1" tool="$2" age="$3" blink="$4"
-  if [ "${COMPACT:-0}" -ge 2 ]; then   # glyph only, the name column has the width
-    case "$s" in
-      waiting)    printf '%s▲%s' "$CORAL$B" "$BOFF$FR" ;;
-      busy|shell) printf '%s●%s' "$CYAN" "$FR" ;;
-      *)          printf '%s○%s' "$MUTED" "$FR" ;;
-    esac; return
-  fi
   case "$s" in
     waiting)
       local tri="▲"; [ "$blink" = 0 ] && tri="${FAINT}▲${CORAL}"
@@ -614,7 +598,7 @@ render_row() {
   # If the name doesn't fit, carry the rest onto the row's spacer line (when
   # there is one) instead of losing it to an ellipsis.
   local overflow=""
-  if [ ${#sess} -gt $SESS_W ] && [ "${ROW_H:-1}" -ge 2 ]; then
+  if [ ${#sess} -gt $SESS_W ] && [ "${ROW_H:-1}" -ge 2 ] && [ "${COMPACT:-0}" -lt 2 ]; then
     # Break on the last space in the column (if it's past the halfway mark) so
     # words don't get cut; otherwise fall back to a hard clip with the ellipsis.
     local head cut; head="${sess:0:$SESS_W}"; cut="${head% *}"
@@ -636,9 +620,7 @@ render_row() {
   local namecell; namecell=$(pad_to $SESS_W "$colored")
 
   # context — solid filled bar; pass row bg so it restores after the bar cells
-  local ctxcell
-  if [ "${COMPACT:-0}" -ge 1 ]; then ctxcell=$(ctx_tok "${R_CTX[$i]}" "${R_MODEL[$i]}")
-  else ctxcell=$(ctx_bar "${R_CTX[$i]}" "${R_MODEL[$i]}" "$ebg"); fi
+  local ctxcell; ctxcell=$(ctx_bar "${R_CTX[$i]}" "${R_MODEL[$i]}" "$ebg")
 
   # model — muted on every row; dropped entirely (with its separator) when compact
   local modelcell=""
@@ -658,6 +640,12 @@ render_row() {
   # any other column; emit() recomputes the row fill from visible width.
   [ "${R_STALE[$i]}" = 1 ] && stcell+="  ${AMBER}⧗ stale${FR}"
 
+  if [ "${COMPACT:-0}" -ge 2 ]; then
+    # stacked: full-width name, then the meter / age / status beneath it
+    emit "$bg" " ${mark} ${idx}  ${namecell}"
+    emit "$bg" " ${mark} $(pad_to $IDX_W '')  ${ctxcell}  ${actcell}  ${stcell}"
+    return
+  fi
   emit "$bg" " ${mark} ${idx}  ${namecell}  ${ctxcell}${modelcell}  ${actcell}  ${stcell}"
   # airy spacer under the row (the mock's row padding). Carries the same tint and
   # continues the left accent bar, so a needs-you/selected highlight reads as a
@@ -784,7 +772,8 @@ render_input() {
 
 # Column geometry. SESS_W is derived so STATUS gets the remainder.
 IDX_W=2; CTX_W=18; MODEL_W=8; ACT_W=4; STATUS_W=15
-SESS_MIN=36   # name width below which columns start collapsing (see compute_geometry)
+SESS_MIN=36   # name width below which the model column is dropped (see compute_geometry)
+SESS_STACK=24 # name width below which rows stack: name line over a metrics line
 # The card floats on the page with a gutter each side; cap its outer width so it
 # stays card-shaped (not a full-bleed banner) on very wide terminals.
 CARD_MAX=118; GUTTER_MIN=2
@@ -803,19 +792,21 @@ compute_geometry() {
   WIDTH=$(( outer - 2 ))    # inner content width, between the side borders
 
   # session name fills the gap so CONTEXT/MODEL/ACT/STATUS sit at the right edge
-  # Narrow windows give the session NAME priority: before the name would drop
-  # below SESS_MIN, first drop the model column and collapse the context meter to
-  # its token count (COMPACT=1), then squeeze status to a single glyph
-  # (COMPACT=2). Only after that does the name itself get clipped.
+  # Narrow windows: the context meter and the status column are the whole point
+  # of the dash, so they are never dropped. Below SESS_MIN the MODEL column goes
+  # first (COMPACT=1) and a name that still overflows wraps onto the row's spacer
+  # line. If the name column would still be useless (< SESS_STACK), the row
+  # stacks (COMPACT=2): name on its own full-width line, meter/age/status on the
+  # line beneath it. Nothing is hidden at any width.
   CTX_W=18; MODEL_W=8; STATUS_W=15; COMPACT=0
   SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - MODEL_W - ACT_W - STATUS_W - 14 ))
   if [ $SESS_W -lt $SESS_MIN ]; then
-    COMPACT=1; MODEL_W=0; CTX_W=5
+    COMPACT=1; MODEL_W=0
     SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - ACT_W - STATUS_W - 12 ))
   fi
-  if [ $SESS_W -lt $SESS_MIN ]; then
-    COMPACT=2; STATUS_W=1
-    SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - ACT_W - STATUS_W - 12 ))
+  if [ $SESS_W -lt $SESS_STACK ]; then
+    COMPACT=2
+    SESS_W=$(( WIDTH - 2 - IDX_W - 4 ))
   fi
   [ $SESS_W -lt 16 ] && SESS_W=16
   [ $SESS_W -gt 64 ] && SESS_W=64
@@ -826,6 +817,7 @@ compute_geometry() {
   PEEK_BODY=9; SUBLINES=0; SHOW_PEEK=1        # airy peek: pad + ~4 lines + spacers
   if [ "$LINES_T" -lt 30 ]; then SHOW_PEEK=0; fi
   if [ "$LINES_T" -lt 24 ]; then ROW_H=1; fi
+  [ "$COMPACT" -ge 2 ] && ROW_H=2   # stacked rows always take two lines
   local peek_h=0
   [ "$SHOW_PEEK" = 1 ] && peek_h=$(( 1 + 1 + PEEK_BODY ))   # rule + title + body region
   # borders (top+bottom) = 2, header = brand + rule = 2, input = rule + bar = 2
