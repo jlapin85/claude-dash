@@ -786,7 +786,7 @@ compute_geometry() {
   # trap: inside a command substitution stdout is a pipe, tput falls back to
   # stderr for the tty, and with stderr silenced it gives up and reports the
   # terminfo default, 80x24, whatever the real window is.
-  local sz; sz=$(stty size < /dev/tty 2>/dev/null)
+  local sz; sz=$( { stty size < /dev/tty; } 2>/dev/null )   # braces: silence a missing /dev/tty too
   if [[ "$sz" =~ ^[0-9]+\ [0-9]+$ ]] && [ "${sz% *}" -gt 0 ] && [ "${sz#* }" -gt 0 ]; then
     lines=${sz% *}; cols=${sz#* }
   else
@@ -809,14 +809,19 @@ compute_geometry() {
   # Wide cards (>= 140 inside) stretch out: a longer context meter, wider gaps
   # between columns, and a taller row rhythm when the terminal has the height.
   CTX_BAR_W=12; GAP="  "
-  if [ $WIDTH -ge 140 ]; then CTX_BAR_W=24; GAP="    "; fi
+  if [ $WIDTH -ge 140 ]; then CTX_BAR_W=32; GAP="    "; fi
   CTX_W=$(( CTX_BAR_W + 6 ))   # bar + space + 5-char token count
 
   # session name fills the gap so CONTEXT/MODEL/ACT/STATUS sit at the right edge
   # fixed cells: 1 pad + mark + 1 pad, five column gaps, 1 right margin
   SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - MODEL_W - ACT_W - STATUS_W - 4 - 5 * ${#GAP} ))
   [ $SESS_W -lt 16 ] && SESS_W=16
-  [ $SESS_W -gt 160 ] && SESS_W=160
+  # On a stretched card the titles are ~60 chars; don't let the name column
+  # push the meters across a sea of black. Cap it at 45% of the card and let
+  # the slack fall at the right edge instead of in the middle of the row.
+  local sess_cap=160
+  [ $WIDTH -ge 140 ] && sess_cap=$(( WIDTH * 45 / 100 ))
+  [ $SESS_W -gt $sess_cap ] && SESS_W=$sess_cap
 
   # ROW_H=2 gives each row an airy spacer line under it (the mock's row padding);
   # drop to 1 on short terminals so more sessions still fit.
