@@ -651,15 +651,15 @@ render_row() {
   # any other column; emit() recomputes the row fill from visible width.
   [ "${R_STALE[$i]}" = 1 ] && stcell+="  ${AMBER}⧗ stale${FR}"
 
-  emit "$bg" " ${mark} ${idx}  ${namecell}  ${ctxcell}  ${modelcell}  ${actcell}  ${stcell}"
+  emit "$bg" " ${mark} ${idx}${GAP}${namecell}${GAP}${ctxcell}${GAP}${modelcell}${GAP}${actcell}${GAP}${stcell}"
   # airy spacer under the row (the mock's row padding). Carries the same tint and
   # continues the left accent bar, so a needs-you/selected highlight reads as a
   # tall band rather than a single thin line.
   # A name's second line goes above the spacer, so a wrapped row keeps the
   # same breathing room as every other row.
   if [ "${ROW_H:-1}" -ge 2 ]; then
-    [ -n "$overflow" ] && emit "$bg" " ${mark} $(pad_to $IDX_W '')  ${sc}${overflow}${FR}"
-    emit "$bg" " ${mark}"
+    [ -n "$overflow" ] && emit "$bg" " ${mark} $(pad_to $IDX_W '')${GAP}${sc}${overflow}${FR}"
+    local sp; for (( sp=1; sp<ROW_H; sp++ )); do emit "$bg" " ${mark}"; done
   fi
 }
 
@@ -779,7 +779,7 @@ render_input() {
 IDX_W=2; CTX_W=18; MODEL_W=8; ACT_W=4; STATUS_W=15
 # The card floats on the page with a gutter each side; cap its outer width so it
 # stays card-shaped (not a full-bleed banner) on very wide terminals.
-CARD_MAX=118; GUTTER_MIN=2; CARD_FRAC=60   # on wide terminals the card takes ~60% of the width
+CARD_MAX=118; GUTTER_MIN=2; CARD_FRAC=85   # on wide terminals the card takes ~85% of the width
 compute_geometry() {
   local cols lines outer cap
   cols=${DASH_COLS:-$(tput cols 2>/dev/null || echo 120)}
@@ -797,10 +797,17 @@ compute_geometry() {
   GUTTER_S=$(printf '%*s' "$GUTTER" '')
   WIDTH=$(( outer - 2 ))    # inner content width, between the side borders
 
+  # Wide cards (>= 140 inside) stretch out: a longer context meter, wider gaps
+  # between columns, and a taller row rhythm when the terminal has the height.
+  CTX_BAR_W=12; GAP="  "
+  if [ $WIDTH -ge 140 ]; then CTX_BAR_W=24; GAP="    "; fi
+  CTX_W=$(( CTX_BAR_W + 6 ))   # bar + space + 5-char token count
+
   # session name fills the gap so CONTEXT/MODEL/ACT/STATUS sit at the right edge
-  SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - MODEL_W - ACT_W - STATUS_W - 14 ))
+  # fixed cells: 1 pad + mark + 1 pad, five column gaps, 1 right margin
+  SESS_W=$(( WIDTH - 2 - IDX_W - CTX_W - MODEL_W - ACT_W - STATUS_W - 4 - 5 * ${#GAP} ))
   [ $SESS_W -lt 16 ] && SESS_W=16
-  [ $SESS_W -gt 120 ] && SESS_W=120
+  [ $SESS_W -gt 160 ] && SESS_W=160
 
   # ROW_H=2 gives each row an airy spacer line under it (the mock's row padding);
   # drop to 1 on short terminals so more sessions still fit.
@@ -808,6 +815,7 @@ compute_geometry() {
   PEEK_BODY=9; SUBLINES=0; SHOW_PEEK=1        # airy peek: pad + ~4 lines + spacers
   if [ "$LINES_T" -lt 30 ]; then SHOW_PEEK=0; fi
   if [ "$LINES_T" -lt 24 ]; then ROW_H=1; fi
+  if [ "$LINES_T" -ge 50 ] && [ $WIDTH -ge 140 ]; then ROW_H=3; fi   # stretched: two spacer lines
   local peek_h=0
   [ "$SHOW_PEEK" = 1 ] && peek_h=$(( 1 + 1 + PEEK_BODY ))   # rule + title + body region
   # borders (top+bottom) = 2, header = brand + rule = 2, input = rule + bar = 2
