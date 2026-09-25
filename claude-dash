@@ -624,7 +624,7 @@ render_row() {
   # bright (active) or muted (idle). Truncated as a whole, then recolored.
   project_color "${R_PROJ[$i]%%/*}"
   split_name "$i"; local sess="$NAME1" overflow="$NAME2"
-  local sc="$MUTED"; [ "$active" = 1 ] && sc="$BRIGHT"
+  local sc="$STEEL"; [ "$active" = 1 ] && sc="$BRIGHT"   # idle titles readable, not muted
   local colored
   if [[ "$sess" == *" · "* ]]; then
     colored="${PCOLOR}${sess%% · *}${sc} · ${sess#* · }${FR}"
@@ -779,7 +779,7 @@ render_input() {
 IDX_W=2; CTX_W=18; MODEL_W=8; ACT_W=4; STATUS_W=15
 # The card floats on the page with a gutter each side; cap its outer width so it
 # stays card-shaped (not a full-bleed banner) on very wide terminals.
-CARD_MAX=118; GUTTER_MIN=2; CARD_FRAC=85   # on wide terminals the card takes ~85% of the width
+CARD_MAX=118; GUTTER_MIN=2; CARD_FRAC=100  # on wide terminals the card spans the full width
 compute_geometry() {
   local cols lines outer cap
   cols=${DASH_COLS:-$(tput cols 2>/dev/null || echo 120)}
@@ -815,7 +815,7 @@ compute_geometry() {
   PEEK_BODY=9; SUBLINES=0; SHOW_PEEK=1        # airy peek: pad + ~4 lines + spacers
   if [ "$LINES_T" -lt 30 ]; then SHOW_PEEK=0; fi
   if [ "$LINES_T" -lt 24 ]; then ROW_H=1; fi
-  if [ "$LINES_T" -ge 50 ] && [ $WIDTH -ge 140 ]; then ROW_H=3; fi   # stretched: two spacer lines
+  if [ "$LINES_T" -ge 50 ] && [ $WIDTH -ge 140 ]; then ROW_H=4; fi   # stretched: three spacer lines
   # borders (top+bottom) = 2, header = brand + rule = 2, input = rule + bar = 2,
   # and the card sits under a 1-line top margin.
   local border_h=2 header_h=2 input_h=2 top_m=1 peek_h
@@ -829,10 +829,11 @@ compute_geometry() {
   # pane before giving up rows. NROWS is last frame's count (empty on the first
   # frame, which just uses the defaults and corrects on the next).
   if [ -n "${NROWS:-}" ] && [ "$NROWS" -gt 0 ]; then
+    # Order of sacrifice: peek pane first (spacing between rows matters more),
+    # then the row rhythm, one line at a time.
     while [ $(( NROWS * ROW_H )) -gt "$TABLE_CAP" ]; do
-      if   [ "$ROW_H" -gt 2 ]; then ROW_H=$(( ROW_H - 1 ))
-      elif [ "$SHOW_PEEK" = 1 ]; then SHOW_PEEK=0; TABLE_CAP=$(table_cap)
-      elif [ "$ROW_H" -gt 1 ]; then ROW_H=1
+      if   [ "$SHOW_PEEK" = 1 ]; then SHOW_PEEK=0; TABLE_CAP=$(table_cap)
+      elif [ "$ROW_H" -gt 1 ]; then ROW_H=$(( ROW_H - 1 ))
       else break; fi
     done
   fi
