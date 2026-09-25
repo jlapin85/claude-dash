@@ -782,8 +782,17 @@ IDX_W=2; CTX_W=18; MODEL_W=8; ACT_W=4; STATUS_W=15
 CARD_MAX=118; GUTTER_MIN=2; CARD_FRAC=100  # on wide terminals the card spans the full width
 compute_geometry() {
   local cols lines outer cap
-  cols=${DASH_COLS:-$(tput cols 2>/dev/null || echo 120)}
-  lines=${DASH_LINES:-$(tput lines 2>/dev/null || echo 40)}
+  # Ask the controlling terminal for its size. `$(tput cols 2>/dev/null)` is a
+  # trap: inside a command substitution stdout is a pipe, tput falls back to
+  # stderr for the tty, and with stderr silenced it gives up and reports the
+  # terminfo default, 80x24, whatever the real window is.
+  local sz; sz=$(stty size < /dev/tty 2>/dev/null)
+  if [[ "$sz" =~ ^[0-9]+\ [0-9]+$ ]] && [ "${sz% *}" -gt 0 ] && [ "${sz#* }" -gt 0 ]; then
+    lines=${sz% *}; cols=${sz#* }
+  else
+    cols=$(tput cols 2>/dev/tty || echo 120); lines=$(tput lines 2>/dev/tty || echo 40)
+  fi
+  cols=${DASH_COLS:-$cols}; lines=${DASH_LINES:-$lines}
   LINES_T=$lines; COLS_T=$cols
 
   # card outer width (incl. the two │ borders), centered with a page gutter.
