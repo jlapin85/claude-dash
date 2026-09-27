@@ -974,10 +974,13 @@ next_alert() { # cycle to the next session in waiting state
 # used one that is not this dash), so this tab stays on the dash. With only one terminal
 # attached, the jump does nothing except say so: open a second tab with `mini`.
 tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
-tmux_other_session() { # -> session name of the most recently active OTHER attached client, or ""
-  local me; me="$(tmux_my_session)"
-  tmux list-clients -F '#{client_activity} #{session_name}' 2>/dev/null \
-    | awk -v me="$me" '$2!=me' | sort -rn | awk 'NR==1{print $2}'
+tmux_other_session() { # -> session name of the most recently active attached client NOT showing the dash, or ""
+  # Judged by what each client is LOOKING AT, not by `display -p '#S'`: with many grouped views
+  # attached, '#S' can name a view other than the one showing the dash, which made a jump
+  # switch the dash tab itself.
+  local dash_win; dash_win=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)
+  tmux list-clients -F '#{client_activity} #{session_name} #{window_id}' 2>/dev/null \
+    | awk -v dw="$dash_win" '$3!=dw' | sort -rn | awk 'NR==1{print $2}'
 }
 tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
   [ -n "$TMUX" ] || return 1
@@ -1094,8 +1097,9 @@ broadcast() {
 }
 
 # `:new <project>` — start a Claude session for ~/projects/<project> (or an absolute path).
-# Inside tmux (the Mac Mini): jump to that window if it exists, else open one running
-# `claude --remote-control <name>`. Outside tmux: a new Terminal tab running claude there.
+# Inside tmux (the Mac Mini): ALWAYS a brand-new chat, same as `p` — mini-new opens its
+# own window (ziplines, ziplines-2, …) and the dash shows it in your other tab.
+# Outside tmux: a new Terminal tab running claude there.
 new_session() {
   local arg="$1" dir name
   [ -n "$arg" ] || { CMD_MSG="usage: :new <project>   (a folder under ~/projects, or a path)"; return; }
@@ -1103,11 +1107,10 @@ new_session() {
   [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
   name="${dir##*/}"
   if [ -n "$TMUX" ]; then
-    local other verb="jumped to"; other=$(tmux_other_session)
-    tmux list-windows -t work -F '#W' 2>/dev/null | grep -qx "$name" \
-      || { tmux new-window -d -t work -n "$name" -c "$dir" "claude --remote-control $name; zsh"; verb="new session:"; }
-    if [ -n "$other" ]; then tmux select-window -t "$other:$name" 2>/dev/null; CMD_MSG="$verb $name — shown in your other tab"
-    else CMD_MSG="$verb $name — open a second tab with \`mini\` to see it"; fi
+    local other; other=$(tmux_other_session)
+    name=$("$HOME/.local/bin/mini-new" --detached "$dir" 2>/dev/null) || { CMD_MSG="couldn't open $name"; return; }
+    if [ -n "$other" ]; then tmux select-window -t "$other:$name" 2>/dev/null; CMD_MSG="new chat: $name — shown in your other tab"
+    else CMD_MSG="new chat: $name — open a second tab with \`mini\` to see it"; fi
   else
     osascript -e "tell application \"Terminal\" to activate" \
       -e "tell application \"System Events\" to keystroke \"t\" using command down" >/dev/null 2>&1
@@ -1394,7 +1397,17 @@ ROWS=$(collect </dev/null 2>/dev/null); parse_rows; resolve_selection
 now=$(date +%s); last_data=$now; SCAN_PID=""; SCANNING=0
 SAY_PID=""; ASK_PID=""; ASKING=0; ANSWER=""; ASK_OUT=""; ASK_ERR=""
 PREV_COLS=0; PREV_LINES=0
+# Self-reload: a running dash picks up a new version of this script by itself (it used
+# to keep running the old code until someone quit and relaunched it, which nobody did).
+SELF="$0"; SELF_MTIME=$(stat -L -f %m "$SELF" 2>/dev/null)
+DASH_ARGS=("$@")
 while true; do
+  if [ "$ASKING" = 0 ] && [ -n "$SELF_MTIME" ] && [ "$(stat -L -f %m "$SELF" 2>/dev/null)" != "$SELF_MTIME" ] \
+     && bash -n "$SELF" 2>/dev/null; then
+    [ -n "$SCAN_PID" ] && kill "$SCAN_PID" 2>/dev/null; rm -f "$SCAN_TMP" 2>/dev/null
+    [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null
+    exec "$SELF" "${DASH_ARGS[@]}"
+  fi
   compute_geometry
   # After a resize the terminal has reflowed the old frame, so overwriting in
   # place leaves fragments of the old layout behind — wipe the slate first.
