@@ -30,8 +30,8 @@ sessions bloat context and cost).
 | Key | Action |
 |---|---|
 | `↑/↓` or `j/k` | move the selection (peek pane follows) |
-| digits + `⏎` | jump to that row's Terminal tab (inside tmux on the Mac Mini: the session is shown in the tab you last typed in that isn't showing the dash, and the dash stays put; with one tab it tells you to open a second with `mini`) |
-| `:new <project>` | a brand-new chat for that folder (on the Mini: its own window, `ziplines-2` etc., shown in your other tab), same as `p` |
+| digits + `⏎` | jump to that row's Terminal tab (inside tmux on the Mac Mini: the tab you're typing in switches to that session; `Ctrl-b D` brings it back to the dash) |
+| `:new <project>` | a brand-new chat for that folder (on the Mini: its own window, `ziplines-2` etc., this tab switches to it), same as `p` |
 | `⏎` | attach to the selected session |
 | `y` / `n` | approve / deny the selected session's permission prompt — from here |
 | `s` | send an instruction to the selected session |

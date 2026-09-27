@@ -969,18 +969,19 @@ next_alert() { # cycle to the next session in waiting state
 # ── terminal actions (tmux when the dash runs inside tmux, else osascript) ──
 # Inside tmux (the Mac Mini), sessions are tmux panes: match the row's tty to a
 # pane and switch windows / send keys with tmux. No Terminal.app, no Accessibility.
-# Each laptop terminal is a grouped tmux session sharing the same windows. The dash is
-# home base: a jump selects the window in the OTHER attached terminal (the most recently
-# used one that is not this dash), so this tab stays on the dash. With only one terminal
-# attached, the jump does nothing except say so: open a second tab with `mini`.
+# Each laptop terminal is a grouped tmux session sharing the same windows. A jump takes
+# the tab you typed in (the one showing the dash) straight to the session's window;
+# Ctrl-b D brings that tab back to the dash. (It used to switch "your other tab" instead —
+# with a dozen-plus tabs attached that was some tab you weren't looking at, so a jump
+# looked like it did nothing.)
 tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
-tmux_other_session() { # -> session name of the most recently active attached client NOT showing the dash, or ""
+tmux_dash_session() { # -> session name of the client that just typed into the dash, or ""
   # Judged by what each client is LOOKING AT, not by `display -p '#S'`: with many grouped views
-  # attached, '#S' can name a view other than the one showing the dash, which made a jump
-  # switch the dash tab itself.
+  # attached, '#S' can name a view other than the one you're typing in. Of the clients showing
+  # the dash window, the one with the latest activity is the one that sent the keypress.
   local dash_win; dash_win=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)
   tmux list-clients -F '#{client_activity} #{session_name} #{window_id}' 2>/dev/null \
-    | awk -v dw="$dash_win" '$3!=dw' | sort -rn | awk 'NR==1{print $2}'
+    | awk -v dw="$dash_win" '$3==dw' | sort -rn | awk 'NR==1{print $2}'
 }
 tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
   [ -n "$TMUX" ] || return 1
@@ -989,15 +990,14 @@ tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
 }
 focus_tab() { # focus_tab <tty>
   if [ -n "$TMUX" ]; then
-    local pane win other; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
+    local pane win me; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
     if [ "$1" = "$DASH_TTY" ]; then tmux select-window -t "$pane" 2>/dev/null; return; fi
     win="${pane#*:}"                      # window.pane
-    other=$(tmux_other_session)
-    if [ -n "$other" ]; then
-      tmux select-window -t "$other:${win%.*}" 2>/dev/null; tmux select-pane -t "$other:$win" 2>/dev/null
-      CMD_MSG="shown in your other tab"
+    me=$(tmux_dash_session)
+    if [ -n "$me" ]; then
+      tmux select-window -t "$me:${win%.*}" 2>/dev/null; tmux select-pane -t "$me:$win" 2>/dev/null
     else
-      CMD_MSG="open a second tab with \`mini\` — the dash shows sessions there"
+      tmux select-window -t "$pane" 2>/dev/null
     fi
     return
   fi
@@ -1098,7 +1098,7 @@ broadcast() {
 
 # `:new <project>` — start a Claude session for ~/projects/<project> (or an absolute path).
 # Inside tmux (the Mac Mini): ALWAYS a brand-new chat, same as `p` — mini-new opens its
-# own window (ziplines, ziplines-2, …) and the dash shows it in your other tab.
+# own window (ziplines, ziplines-2, …) and this tab switches to it (Ctrl-b D comes back).
 # Outside tmux: a new Terminal tab running claude there.
 new_session() {
   local arg="$1" dir name
@@ -1107,10 +1107,9 @@ new_session() {
   [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
   name="${dir##*/}"
   if [ -n "$TMUX" ]; then
-    local other; other=$(tmux_other_session)
+    local me; me=$(tmux_dash_session)
     name=$("$HOME/.local/bin/mini-new" --detached "$dir" 2>/dev/null) || { CMD_MSG="couldn't open $name"; return; }
-    if [ -n "$other" ]; then tmux select-window -t "$other:$name" 2>/dev/null; CMD_MSG="new chat: $name — shown in your other tab"
-    else CMD_MSG="new chat: $name — open a second tab with \`mini\` to see it"; fi
+    tmux select-window -t "${me:-work}:$name" 2>/dev/null; CMD_MSG="new chat: $name — Ctrl-b D returns to the dash"
   else
     osascript -e "tell application \"Terminal\" to activate" \
       -e "tell application \"System Events\" to keystroke \"t\" using command down" >/dev/null 2>&1
