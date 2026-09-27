@@ -969,10 +969,16 @@ next_alert() { # cycle to the next session in waiting state
 # ── terminal actions (tmux when the dash runs inside tmux, else osascript) ──
 # Inside tmux (the Mac Mini), sessions are tmux panes: match the row's tty to a
 # pane and switch windows / send keys with tmux. No Terminal.app, no Accessibility.
-# Targets are resolved in the dash's OWN tmux session. Each laptop terminal is a
-# grouped session sharing the windows, so selecting in another session's name would
-# switch a different terminal's view and leave this one where it was.
+# Each laptop terminal is a grouped tmux session sharing the same windows. The dash is
+# home base: a jump selects the window in the OTHER attached terminal (the most recently
+# used one that is not this dash), so this tab stays on the dash. With only one terminal
+# attached, the jump does nothing except say so: open a second tab with `mini`.
 tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
+tmux_other_session() { # -> session name of the most recently active OTHER attached client, or ""
+  local me; me="$(tmux_my_session)"
+  tmux list-clients -F '#{client_activity} #{session_name}' 2>/dev/null \
+    | awk -v me="$me" '$2!=me' | sort -rn | awk 'NR==1{print $2}'
+}
 tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
   [ -n "$TMUX" ] || return 1
   tmux list-panes -s -t "$(tmux_my_session)" -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
@@ -980,8 +986,16 @@ tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
 }
 focus_tab() { # focus_tab <tty>
   if [ -n "$TMUX" ]; then
-    local pane; pane=$(tmux_pane_for_tty "$1")
-    [ -n "$pane" ] && { tmux select-window -t "$pane" 2>/dev/null; tmux select-pane -t "$pane" 2>/dev/null; }
+    local pane win other; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
+    if [ "$1" = "$DASH_TTY" ]; then tmux select-window -t "$pane" 2>/dev/null; return; fi
+    win="${pane#*:}"                      # window.pane
+    other=$(tmux_other_session)
+    if [ -n "$other" ]; then
+      tmux select-window -t "$other:${win%.*}" 2>/dev/null; tmux select-pane -t "$other:$win" 2>/dev/null
+      CMD_MSG="shown in your other tab"
+    else
+      CMD_MSG="open a second tab with \`mini\` — the dash shows sessions there"
+    fi
     return
   fi
   osascript >/dev/null 2>&1 <<EOF
@@ -1089,11 +1103,11 @@ new_session() {
   [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
   name="${dir##*/}"
   if [ -n "$TMUX" ]; then
-    local me; me="$(tmux_my_session)"
-    tmux select-window -t "$me:$name" 2>/dev/null && { CMD_MSG="jumped to $name"; return; }
-    tmux new-window -d -t work -n "$name" -c "$dir" "claude --remote-control $name; zsh"
-    tmux select-window -t "$me:$name" 2>/dev/null
-    CMD_MSG="new session: $name"
+    local other verb="jumped to"; other=$(tmux_other_session)
+    tmux list-windows -t work -F '#W' 2>/dev/null | grep -qx "$name" \
+      || { tmux new-window -d -t work -n "$name" -c "$dir" "claude --remote-control $name; zsh"; verb="new session:"; }
+    if [ -n "$other" ]; then tmux select-window -t "$other:$name" 2>/dev/null; CMD_MSG="$verb $name — shown in your other tab"
+    else CMD_MSG="$verb $name — open a second tab with \`mini\` to see it"; fi
   else
     osascript -e "tell application \"Terminal\" to activate" \
       -e "tell application \"System Events\" to keystroke \"t\" using command down" >/dev/null 2>&1

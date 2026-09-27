@@ -30,7 +30,7 @@ sessions bloat context and cost).
 | Key | Action |
 |---|---|
 | `↑/↓` or `j/k` | move the selection (peek pane follows) |
-| digits + `⏎` | jump to that row's Terminal tab |
+| digits + `⏎` | jump to that row's Terminal tab (inside tmux on the Mac Mini: the session is shown in your OTHER attached tab and the dash stays put; with one tab it tells you to open a second with `mini`) |
 | `⏎` | attach to the selected session |
 | `y` / `n` | approve / deny the selected session's permission prompt — from here |
 | `s` | send an instruction to the selected session |
