@@ -969,19 +969,24 @@ next_alert() { # cycle to the next session in waiting state
 # ── terminal actions (tmux when the dash runs inside tmux, else osascript) ──
 # Inside tmux (the Mac Mini), sessions are tmux panes: match the row's tty to a
 # pane and switch windows / send keys with tmux. No Terminal.app, no Accessibility.
-# Each laptop terminal is a grouped tmux session sharing the same windows. A jump takes
-# the tab you typed in (the one showing the dash) straight to the session's window;
-# Ctrl-b D brings that tab back to the dash. (It used to switch "your other tab" instead —
-# with a dozen-plus tabs attached that was some tab you weren't looking at, so a jump
-# looked like it did nothing.)
+# Each laptop terminal tab is a grouped tmux session (over its own ssh connection) sharing the
+# same windows. The dash is home base and its tab never changes: a jump brings forward the LAPTOP
+# tab already showing that session, or opens a new tab on it. The Mini can't script the laptop's
+# Terminal, so the dash appends a request to ~/.claude-dash/jumps and dash-jump-listener
+# (mini-setup, running on the laptop) acts on it:
+#   tab <port>    the tab whose ssh connection comes from laptop port <port>
+#   new <window>  no tab shows it: open one attached to that window
 tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
-tmux_dash_session() { # -> session name of the client that just typed into the dash, or ""
-  # Judged by what each client is LOOKING AT, not by `display -p '#S'`: with many grouped views
-  # attached, '#S' can name a view other than the one you're typing in. Of the clients showing
-  # the dash window, the one with the latest activity is the one that sent the keypress.
-  local dash_win; dash_win=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)
-  tmux list-clients -F '#{client_activity} #{session_name} #{window_id}' 2>/dev/null \
-    | awk -v dw="$dash_win" '$3==dw' | sort -rn | awk 'NR==1{print $2}'
+JUMPS_FILE="$HOME/.claude-dash/jumps"
+jump_listener_up() { pgrep -qf "tail -n0 -F $JUMPS_FILE" 2>/dev/null || pgrep -qf "tail -n0 -F ~/.claude-dash/jumps" 2>/dev/null; }
+tmux_tab_port() { # tmux_tab_port <window_id> -> laptop-side ssh port of the most recently used tab showing it
+  local dash_win cpid spid; dash_win=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)
+  [ "$1" = "$dash_win" ] && return
+  cpid=$(tmux list-clients -F '#{client_activity} #{client_pid} #{window_id}' 2>/dev/null \
+    | awk -v w="$1" '$3==w' | sort -rn | awk 'NR==1{print $2}')
+  [ -n "$cpid" ] || return
+  spid=$(ps -o ppid= -p "$cpid" 2>/dev/null | tr -d ' ')   # the sshd-session that owns the tab's pty
+  lsof -nP -a -p "$spid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1{n=split($9,a,":"); print a[n]; exit}'
 }
 tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
   [ -n "$TMUX" ] || return 1
@@ -990,15 +995,17 @@ tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
 }
 focus_tab() { # focus_tab <tty>
   if [ -n "$TMUX" ]; then
-    local pane win me; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
+    local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
     if [ "$1" = "$DASH_TTY" ]; then tmux select-window -t "$pane" 2>/dev/null; return; fi
-    win="${pane#*:}"                      # window.pane
-    me=$(tmux_dash_session)
-    if [ -n "$me" ]; then
-      tmux select-window -t "$me:${win%.*}" 2>/dev/null; tmux select-pane -t "$me:$win" 2>/dev/null
-    else
-      tmux select-window -t "$pane" 2>/dev/null
+    local wid wname port
+    wid=$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null); wname=$(tmux display -p -t "$pane" '#W' 2>/dev/null)
+    if ! jump_listener_up; then
+      CMD_MSG="laptop jump helper isn't running — open a new laptop Terminal window (after install-laptop.sh)"; return
     fi
+    mkdir -p "${JUMPS_FILE%/*}"
+    port=$(tmux_tab_port "$wid")
+    if [ -n "$port" ]; then echo "tab $port" >>"$JUMPS_FILE"; CMD_MSG="→ $wname (its tab)"
+    else echo "new $wname" >>"$JUMPS_FILE"; CMD_MSG="→ $wname (opening a tab for it)"; fi
     return
   fi
   osascript >/dev/null 2>&1 <<EOF
@@ -1098,7 +1105,7 @@ broadcast() {
 
 # `:new <project>` — start a Claude session for ~/projects/<project> (or an absolute path).
 # Inside tmux (the Mac Mini): ALWAYS a brand-new chat, same as `p` — mini-new opens its
-# own window (ziplines, ziplines-2, …) and this tab switches to it (Ctrl-b D comes back).
+# own window (ziplines, ziplines-2, …) and the laptop opens a new tab on it (dash-jump-listener).
 # Outside tmux: a new Terminal tab running claude there.
 new_session() {
   local arg="$1" dir name
@@ -1107,9 +1114,9 @@ new_session() {
   [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
   name="${dir##*/}"
   if [ -n "$TMUX" ]; then
-    local me; me=$(tmux_dash_session)
     name=$("$HOME/.local/bin/mini-new" --detached "$dir" 2>/dev/null) || { CMD_MSG="couldn't open $name"; return; }
-    tmux select-window -t "${me:-work}:$name" 2>/dev/null; CMD_MSG="new chat: $name — Ctrl-b D returns to the dash"
+    if jump_listener_up; then mkdir -p "${JUMPS_FILE%/*}"; echo "new $name" >>"$JUMPS_FILE"; CMD_MSG="new chat: $name — opening a tab for it"
+    else CMD_MSG="new chat: $name — Ctrl-b w to open it (laptop jump helper isn't running)"; fi
   else
     osascript -e "tell application \"Terminal\" to activate" \
       -e "tell application \"System Events\" to keystroke \"t\" using command down" >/dev/null 2>&1
