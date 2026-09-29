@@ -29,6 +29,8 @@
 # Usage:
 #   claude-dash          interactive
 #   claude-dash --once   print one frame and exit (for testing)
+#   DASH_SIDEBAR=1       the narrow two-line-per-session layout (any of the above)
+#   DASH_COCKPIT=<view>  cockpit mode, set by mini-setup/mini-cockpit (see "cockpit mode" below)
 #
 # Jump/send/answer target macOS Terminal.app tabs, matched by tty, via
 # System Events keystrokes — needs Terminal enabled under System Settings >
@@ -41,6 +43,69 @@ BELL=1                          # ring terminal bell when a session flips to nee
 STALE_HOURS=12                  # sessions whose transcript started >this get a dim 'stale' marker (marathon sessions bloat context/cost)
 VOICE="Samantha"                # `say -v '?'` to list; premium voices sound best
 SPEECH_RATE=195                 # words per minute for spoken briefings/answers
+
+# ── cockpit mode ─────────────────────────────────────────────────────────────
+# The cockpit (mini-setup/mini-cockpit) is one terminal split in two: this dash in a narrow
+# pane on the left, the session you picked in the pane on the right. The two panes belong to an
+# outer tmux server of their own; the right pane holds a client of the usual server, attached
+# to a view of the `work` windows. The cockpit starts the dash with DASH_COCKPIT=<that view>.
+# A jump changes the window that view shows and moves the keyboard to the right pane. Both are
+# commands run on this machine, so the dash never leaves the screen and nothing is asked of
+# the laptop.
+# $TMUX points at the OUTER server in that pane. It is dropped here so that every `tmux`
+# below, and every script started from here, talks to the usual server, where the sessions
+# are; the outer server is reached through otmux.
+IN_TMUX=""; [ -n "$TMUX" ] && IN_TMUX=1
+COCKPIT="${DASH_COCKPIT:-}"
+SIDEBAR="${DASH_SIDEBAR:-}"
+if [ -n "$COCKPIT" ]; then
+  : "${DASH_COCKPIT_SOCK:=${TMUX%%,*}}" "${DASH_COCKPIT_PANE:=$TMUX_PANE}"
+  export DASH_COCKPIT_SOCK DASH_COCKPIT_PANE   # a self-reload starts without $TMUX
+  unset TMUX TMUX_PANE
+  IN_TMUX=1; SIDEBAR=1
+fi
+otmux() { tmux -S "$DASH_COCKPIT_SOCK" "$@"; }
+cockpit_session_pane() { # -> the pane beside the dash, where the session shows
+  otmux list-panes -t "$DASH_COCKPIT_PANE" -F '#{pane_id}' 2>/dev/null | grep -vx -- "$DASH_COCKPIT_PANE" | head -1
+}
+cockpit_focus_session() { local sp; sp=$(cockpit_session_pane); [ -n "$sp" ] && otmux select-pane -t "$sp" 2>/dev/null; }
+# Every jump is written to ~/.claude-dash/cockpit.log (what was asked, what happened), so "the
+# number didn't work" can be looked up afterwards. `touch ~/.claude-dash/debug` logs every key too.
+COCKPIT_LOG="$HOME/.claude-dash/cockpit.log"
+clog() {
+  [ -n "$COCKPIT" ] || return 0
+  [ -f "$COCKPIT_LOG" ] && [ "$(wc -l <"$COCKPIT_LOG")" -gt 1000 ] && { tail -n 500 "$COCKPIT_LOG" >"$COCKPIT_LOG.tmp" && mv "$COCKPIT_LOG.tmp" "$COCKPIT_LOG"; }
+  printf '%s %s %s
+' "$(date '+%m-%d %H:%M:%S')" "${COCKPIT#view-}" "$*" >>"$COCKPIT_LOG"
+}
+cockpit_show() { # cockpit_show <window: @id or =name> <label> -> the right pane shows it and takes the keyboard
+  if ! tmux select-window -t "=$COCKPIT:$1" 2>/dev/null; then
+    CMD_MSG="couldn't show $2"; clog "FAIL show $1 ($2): select-window refused"; return 1
+  fi
+  cockpit_focus_session
+  CMD_MSG="→ $2"; clog "show $1 ($2)"
+}
+# A background session (started with `claude --bg` or from the agents view) has no tmux window:
+# it runs on a terminal of its own. Its number opens it with `claude attach` in a window named
+# bg-<id>, or goes to that window when it is already open.
+cockpit_show_background() { # cockpit_show_background <tty>
+  local i f="" job cwd
+  for (( i=1; i<=NROWS; i++ )); do [ "${R_TTY[$i]}" = "$1" ] && { f="$SESSIONS_DIR/${R_PID[$i]}.json"; break; }; done
+  job=$(jq -r 'select(.kind == "bg") | .jobId // empty' "$f" 2>/dev/null)
+  if [ -z "$job" ]; then CMD_MSG="no window for that session"; clog "FAIL no pane for tty $1"; return 1; fi
+  if ! tmux list-windows -t work -F '#W' 2>/dev/null | grep -qx -- "bg-$job"; then
+    cwd=$(jq -r '.cwd // empty' "$f" 2>/dev/null); [ -d "$cwd" ] || cwd="$HOME"
+    tmux new-window -d -t work -n "bg-$job" -c "$cwd" "claude attach $job" 2>/dev/null       || { CMD_MSG="couldn't open background session $job"; clog "FAIL new-window bg-$job"; return 1; }
+  fi
+  cockpit_show "=bg-$job" "background session $job"
+}
+# The divider between the overview and the session can be dragged with the mouse; < and > move
+# it 10 columns from the keyboard. mini-cockpit keeps the width (it survives a reconnect).
+cockpit_side() { # cockpit_side <+N|-N>
+  local w; w=$("$HOME/.local/bin/mini-cockpit" --side "cockpit-${COCKPIT#view-}" "$1" 2>/dev/null)
+  RESIZED=1; [ -n "$w" ] && CMD_MSG="overview $w columns wide"
+}
+cockpit_attached() { [ "$(otmux display-message -p -t "$DASH_COCKPIT_PANE" '#{session_attached}' 2>/dev/null)" != 0 ]; }
 
 # ── color system (truecolor / 24-bit) ────────────────────────────────────────
 # The reference mock (design 2b) is specified in exact hex. Emit 24-bit
@@ -297,7 +362,7 @@ rel_time() { # ms epoch -> "3m", "2h", "1d"
 # closed sessions lingered on screen that long. Skip it under tmux, and cap the
 # wait everywhere else so an unresponsive Terminal can't stall a scan again.
 tab_titles() {
-  [ -n "$TMUX" ] && return
+  [ -n "$IN_TMUX" ] && return
   osascript 2>/dev/null <<'APPLESCRIPT'
 if application "Terminal" is not running then return ""
 set out to ""
@@ -505,6 +570,10 @@ emit() { # emit <bg-or-empty> <content>  (empty bg -> card canvas)
   local bg="$1"; [ -z "$bg" ] && bg="$BG_MAIN"
   local content="$2" vl filln
   vl=$(vis_len "$content"); filln=$(( WIDTH - vl )); [ $filln -lt 0 ] && filln=0
+  if [ -n "$SIDEBAR" ]; then   # the pane is the card: no gutter, no border of its own
+    FRAME+="${bg}${content}${bg}$(printf '%*s' "$filln" '')"$'\033[K'"$RST"$'\n'
+    FLINES=$((FLINES+1)); return
+  fi
   FRAME+="${PAGE_BG}${GUTTER_S}${bg}${BORDER}│${bg}${content}${bg}$(printf '%*s' "$filln" '')${BORDER}│${PAGE_BG}"$'\033[K'"$RST"$'\n'
   FLINES=$((FLINES+1))
 }
@@ -512,12 +581,17 @@ emit() { # emit <bg-or-empty> <content>  (empty bg -> card canvas)
 # A horizontal rule spanning the card interior, tied into the side borders as
 # ├──────┤ in the given color (header/peek/input dividers).
 emit_divider() { # emit_divider <color>
+  if [ -n "$SIDEBAR" ]; then
+    FRAME+="${BG_MAIN}${1}$(printf '%*s' "$WIDTH" '' | tr ' ' '─')"$'\033[K'"$RST"$'\n'
+    FLINES=$((FLINES+1)); return
+  fi
   FRAME+="${PAGE_BG}${GUTTER_S}${BG_MAIN}${1}├$(printf '%*s' "$WIDTH" '' | tr ' ' '─')┤${PAGE_BG}"$'\033[K'"$RST"$'\n'
   FLINES=$((FLINES+1))
 }
 
 # The rounded top (╭──╮) or bottom (╰──╯) edge of the card.
 emit_border() { # emit_border <top|bottom>
+  [ -n "$SIDEBAR" ] && return
   local lc="╭" rc="╮"; [ "$1" = bottom ] && { lc="╰"; rc="╯"; }
   FRAME+="${PAGE_BG}${GUTTER_S}${BG_MAIN}${BORDER}${lc}$(printf '%*s' "$WIDTH" '' | tr ' ' '─')${rc}${PAGE_BG}"$'\033[K'"$RST"$'\n'
   FLINES=$((FLINES+1))
@@ -563,6 +637,15 @@ render_header() {
   fi
   chips+="${CYAN}● ${busy_n} working${FR}  ${MUTED}○ ${idle_n} idle${FR}"
   local right="${MUTED}ctx ${FR}${BASE}$(fmt_tok "$ctx_total")${MUTED}   ${BASE}$(date +%H:%M:%S)${FR}"
+  if [ -n "$SIDEBAR" ]; then
+    left="${AMBER}${B}⚡ FLEET${BOFF}${FR}"; chips=""
+    if [ "$need_n" -gt 0 ]; then
+      local tri2="▲"; [ "$blink" = 0 ] && tri2="${FAINT}▲${CORAL}${B}"
+      chips+="${CORAL}${B}${tri2} ${need_n} need you${BOFF}${FR}  "
+    fi
+    chips+="${CYAN}● ${busy_n}${FR}  ${MUTED}○ ${idle_n}${FR}"
+    right="${MUTED}ctx ${FR}${BASE}$(fmt_tok "$ctx_total")${FR}"
+  fi
 
   # Budget every visible cell so the clock never spills past the edge (which,
   # with line-wrap off, would truncate it): 1 leading space + left + ⚡ renders
@@ -586,7 +669,7 @@ split_name() {
   local i="$1" sess="${R_PROJ[$1]}"
   [ -n "${R_NAME[$i]}" ] && sess+=" · ${R_NAME[$i]}"
   NAME2=""
-  if [ ${#sess} -gt $SESS_W ] && [ "${ROW_H:-1}" -ge 2 ]; then
+  if [ ${#sess} -gt $SESS_W ] && { [ "${ROW_H:-1}" -ge 2 ] || [ -n "$SIDEBAR" ]; }; then
     local head cut; head="${sess:0:$SESS_W}"; cut="${head% *}"
     if [ "$cut" != "$head" ] && [ ${#cut} -ge $(( SESS_W / 2 )) ]; then
       NAME2="${sess:$(( ${#cut} + 1 ))}"; sess="$cut"
@@ -601,7 +684,7 @@ split_name() {
 }
 row_height() { # row_height <idx> -> lines this row takes (its spacer included)
   local h=${ROW_H:-1}
-  if [ "$h" -ge 2 ]; then split_name "$1"; [ -n "$NAME2" ] && h=$(( h + 1 )); fi
+  if [ "$h" -ge 2 ] || [ -n "$SIDEBAR" ]; then split_name "$1"; [ -n "$NAME2" ] && h=$(( h + 1 )); fi
   printf '%s' "$h"
 }
 
@@ -651,6 +734,25 @@ render_row() {
   # activity age — steel (active) or muted (idle)
   local ac="$MUTED"; [ "$active" = 1 ] && ac="$STEEL"
   local actcell="${ac}$(pad_to $ACT_W "${R_AGE[$i]}")${FR}"
+
+  # Sidebar: two lines per session. The name gets a line of its own (number, state mark, then
+  # "project · title"); context, model, age and state sit under it, in line with the name.
+  if [ -n "$SIDEBAR" ]; then
+    local glyph words tool="${R_TOOL[$i]##*__}"
+    case "$st" in
+      waiting) glyph="${CORAL}▲${FR}"; [ "$blink" = 0 ] && glyph="${FAINT}▲${FR}"; words="${CORAL}${B}needs you${BOFF}${FR}" ;;
+      busy)    glyph="${CYAN}●${FR}";  words="${CYAN}$(clip 11 "${tool:-working}")${FR}" ;;
+      shell)   glyph="${CYAN}❯${FR}";  words="${CYAN}shell${FR}" ;;
+      *)       glyph="${MUTED}○${FR}"; words="${MUTED}idle${FR}" ;;
+    esac
+    [ "${R_STALE[$i]}" = 1 ] && words+=" ${AMBER}⧗${FR}"
+    local under=" ${mark}$(pad_to $IDX_W '')   "
+    emit "$bg" " ${mark}${idx} ${glyph} ${namecell}"
+    [ -n "$overflow" ] && emit "$bg" "${under}${sc}${overflow}${FR}"
+    emit "$bg" "${under}${ctxcell}${GAP}${modelcell}${GAP}${actcell}${GAP}${words}"
+    [ "${ROW_H:-2}" -ge 3 ] && emit "$bg" " ${mark}"
+    return
+  fi
 
   # status
   local stcell; stcell=$(status_cell "$st" "${R_TOOL[$i]}" "${R_AGE[$i]}" "$blink")
@@ -706,7 +808,10 @@ render_peek() {
     label="${MUTED}${state}${FR}"
   fi
   right="${FAINT}↑↓ select row to peek${FR}"
-  local title=" ${badge} ${BRIGHT}$(clip $(( WIDTH - 40 )) "$path")${FR}  ${label}"
+  local pathw=$(( WIDTH - 40 ))
+  if [ -n "$SIDEBAR" ]; then right=""; pathw=$(( WIDTH - 9 - $(vis_len "$label") )); fi
+  [ $pathw -lt 8 ] && pathw=8
+  local title=" ${badge} ${BRIGHT}$(clip $pathw "$path")${FR}  ${label}"
   local pad=$(( WIDTH - $(vis_len "$title") - $(vis_len "$right") - 1 ))
   [ $pad -lt 1 ] && pad=1
   emit "$tbg" "${title}$(printf '%*s' "$pad" '')${right} "
@@ -760,6 +865,7 @@ render_input() {
     # slow you type, and a lone lead digit never jumps to the wrong tab.
     prompt="${CYAN}${B}⇢${BOFF}${FR} ${BRIGHT}jump to session ${GOTO}${CYAN}${cur}${FR}"
     right="${FAINT}another digit · ${CYAN}⏎${FAINT} go · ${CYAN}esc${FAINT} cancel${FR}"
+    [ -n "$SIDEBAR" ] && right="${FAINT}${CYAN}⏎${FAINT} go · ${CYAN}esc${FAINT} cancel${FR}"
   elif [ "${ASKING:-0}" = 1 ]; then
     prompt="${CYAN}🤔${FR} ${STEEL}thinking…${FR}"
     right="${FAINT}Claude is answering${FR}"
@@ -777,6 +883,10 @@ render_input() {
     # in the idle state the useful hint is the keys, not SEND/CANCEL (which only
     # apply while typing); ? opens the full shortcuts panel
     right="${FAINT}${CYAN}v${FAINT} speak · ${CYAN}a${FAINT} ask · ${CYAN}s${FAINT} send · ${CYAN}?${FAINT} help${FR}"
+    if [ -n "$SIDEBAR" ]; then
+      prompt="${CYAN}${B}›${BOFF}${FR} ${FAINT}row ${tgt}${CYAN}${cur}${FR}"
+      right="${FAINT}${CYAN}1-9${FAINT} jump · ${CYAN}s${FAINT} send · ${CYAN}y n${FAINT} answer · ${CYAN}?${FAINT} help${FR}"
+    fi
   fi
   local pad=$(( WIDTH - $(vis_len "$prompt") - $(vis_len "$right") - 2 ))
   [ $pad -lt 1 ] && pad=1
@@ -802,6 +912,34 @@ compute_geometry() {
   fi
   cols=${DASH_COLS:-$cols}; lines=${DASH_LINES:-$lines}
   LINES_T=$lines; COLS_T=$cols
+
+  # In the cockpit the layout follows the width of the pane: dragged out to 100 columns or
+  # more the overview is the full table (one line per session, peek pane), narrower it is
+  # the sidebar.
+  if [ -n "$COCKPIT" ]; then if [ "$cols" -ge 100 ]; then SIDEBAR=""; else SIDEBAR=1; fi; fi
+  MODEL_W=8
+  # Sidebar: the whole pane is the card. A row is its name line and its numbers line, plus a
+  # spacer line while the fleet fits (ROW_H 3); a name too long for the pane takes one more
+  # line. Every session stays on screen: the peek pane goes first, then the spacers.
+  if [ -n "$SIDEBAR" ]; then
+    GUTTER=0; GUTTER_S=""; WIDTH=$cols
+    CTX_BAR_W=12; GAP="  "; CTX_W=$(( CTX_BAR_W + 6 )); MODEL_W=9
+    SESS_W=$(( WIDTH - 8 )); [ $SESS_W -lt 16 ] && SESS_W=16   # " ▌12 ● " before the name, 1 after
+    PEEK_BODY=9; SUBLINES=0; SHOW_PEEK=1; ROW_H=3
+    [ "$LINES_T" -lt 30 ] && SHOW_PEEK=0
+    sidebar_cap() { local p=0; [ "$SHOW_PEEK" = 1 ] && p=$(( 1 + 1 + PEEK_BODY )); printf '%s' $(( LINES_T - 2 - p - 2 )); }
+    sidebar_need() { local n=0 r; for (( r=1; r<=${NROWS:-0}; r++ )); do n=$(( n + $(row_height "$r") )); done; printf '%s' "$n"; }
+    TABLE_CAP=$(sidebar_cap)
+    if [ -n "${NROWS:-}" ] && [ "$NROWS" -gt 0 ]; then
+      while [ "$(sidebar_need)" -gt "$TABLE_CAP" ]; do
+        if   [ "$SHOW_PEEK" = 1 ]; then SHOW_PEEK=0; TABLE_CAP=$(sidebar_cap)
+        elif [ "$ROW_H" -gt 2 ]; then ROW_H=2
+        else break; fi
+      done
+    fi
+    [ $TABLE_CAP -lt 3 ] && TABLE_CAP=3
+    return
+  fi
 
   # card outer width (incl. the two │ borders), centered with a page gutter.
   # The cap scales with very wide terminals (a small font on a big display)
@@ -921,6 +1059,7 @@ render() {
   # Stretch the card to the bottom of the terminal: pad the table region out to
   # its full budget so the peek and input sit at the foot of the card.
   local table_used=$(( FLINES - 3 ))   # top border + brand + rule
+  [ -n "$SIDEBAR" ] && table_used=$(( FLINES - 2 ))   # no border line
   local fill_n=$(( TABLE_CAP - table_used )) f
   for (( f=0; f<fill_n; f++ )); do emit "" ""; done
   [ "$SHOW_PEEK" = 1 ] && render_peek
@@ -933,9 +1072,11 @@ render() {
   # covers the whole terminal. INPUT_ROW records the input line's screen row for
   # focus_input (it's the second-to-last card line: … input, bottom border).
   local card_h=$FLINES top_m=1 extra
+  [ -n "$SIDEBAR" ] && top_m=0
   extra=$(( LINES_T - card_h )); [ $extra -lt 0 ] && extra=0
   [ $top_m -gt $extra ] && top_m=$extra
   INPUT_ROW=$(( top_m + card_h - 1 ))
+  [ -n "$SIDEBAR" ] && INPUT_ROW=$card_h   # no bottom border under the input line
   local pm="" bf="" k
   for (( k=0; k<top_m; k++ )); do pm+="${PAGE_BG}"$'\033[K'"$RST"$'\n'; done
   for (( k=0; k<extra-top_m; k++ )); do bf+="${PAGE_BG}"$'\033[K'"$RST"$'\n'; done
@@ -989,7 +1130,9 @@ next_alert() { # cycle to the next session in waiting state
 # without knowing: when the laptop side failed, a jump did nothing and said "→ its tab". Now it
 # waits for the answer, and on `fail` or silence it takes the tab you typed in to the session
 # instead (Ctrl-b D comes back) and says why the laptop didn't do it.
-tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
+tmux_my_session() {
+  if [ -n "$COCKPIT" ]; then printf '%s\n' "$COCKPIT"; else tmux display-message -p '#S' 2>/dev/null; fi
+}
 JUMPS_FILE="$HOME/.claude-dash/jumps"
 ACKS_FILE="$HOME/.claude-dash/acks"
 JUMP_WHY=""; HELPER_DOWN_UNTIL=0
@@ -1045,7 +1188,7 @@ tmux_tab_port() { # tmux_tab_port <window_id> -> laptop-side ssh port of the mos
   lsof -nP -a -p "$spid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1{n=split($9,a,":"); print a[n]; exit}'
 }
 tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
-  [ -n "$TMUX" ] || return 1
+  [ -n "$IN_TMUX" ] || return 1
   tmux list-panes -s -t "$(tmux_my_session)" -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
     | awk -v t="/dev/$1" '$1==t{print $2; exit}'
 }
@@ -1064,8 +1207,13 @@ drain_keys() {
 }
 jump_to() { focus_tab "$1"; drain_keys; JUMPED_AT=$SECONDS; } # jump_to <tty>
 focus_tab() { # focus_tab <tty>
-  if [ -n "$TMUX" ]; then
-    local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
+  if [ -n "$IN_TMUX" ]; then
+    local pane; pane=$(tmux_pane_for_tty "$1")
+    [ -n "$pane" ] || { [ -n "$COCKPIT" ] && cockpit_show_background "$1"; return; }
+    if [ -n "$COCKPIT" ]; then
+      cockpit_show "$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null)" "$(tmux display-message -p -t "$pane" '#W' 2>/dev/null)"
+      return
+    fi
     if [ "$1" = "$DASH_TTY" ]; then tmux select-window -t "$pane" 2>/dev/null; return; fi
     local wid wname port
     wid=$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null); wname=$(tmux display -p -t "$pane" '#W' 2>/dev/null)
@@ -1107,7 +1255,7 @@ EOF
 }
 
 send_message() { # send_message <tty> <text> [return-tty]  ("" = don't return)
-  if [ -n "$TMUX" ]; then
+  if [ -n "$IN_TMUX" ]; then
     local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
     tmux send-keys -t "$pane" -l -- "$2"; sleep 0.15; tmux send-keys -t "$pane" Enter
     return
@@ -1121,7 +1269,7 @@ send_message() { # send_message <tty> <text> [return-tty]  ("" = don't return)
 # Answer the selected session's permission prompt from the dashboard.
 # approve -> press 1 (approve once); deny -> Escape (cancels the prompt).
 answer_prompt() { # answer_prompt <tty> <approve|deny>
-  if [ -n "$TMUX" ]; then
+  if [ -n "$IN_TMUX" ]; then
     local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
     if [ "$2" = approve ]; then tmux send-keys -t "$pane" 1; else tmux send-keys -t "$pane" Escape; fi
     return
@@ -1185,9 +1333,10 @@ new_session() {
   case "$arg" in /*|~*) dir="${arg/#\~/$HOME}" ;; *) dir="$HOME/projects/$arg" ;; esac
   [ -d "$dir" ] || { CMD_MSG="no such folder: $dir"; return; }
   name="${dir##*/}"
-  if [ -n "$TMUX" ]; then
+  if [ -n "$IN_TMUX" ]; then
     name=$("$HOME/.local/bin/mini-new" --detached "$dir" 2>/dev/null) || { CMD_MSG="couldn't open $name"; return; }
-    if ask_laptop "new $name" 4; then CMD_MSG="new chat: $name — opened a tab for it"
+    if [ -n "$COCKPIT" ]; then cockpit_show "=$name" "new chat: $name"
+    elif ask_laptop "new $name" 4; then CMD_MSG="new chat: $name — opened a tab for it"
     else show_here "=$name" "Ctrl-b D returns to the dash · $JUMP_WHY"; CMD_MSG="new chat: $name in this tab · Ctrl-b D returns · ${JUMP_WHY}"; fi
   else
     osascript -e "tell application \"Terminal\" to activate" \
@@ -1208,7 +1357,7 @@ command_mode() {
   verb="${line%% *}"; arg="${line#"$verb"}"; arg="${arg# }"
   case "$verb" in
     h|help|'?'|shortcuts|keys) show_help ;;
-    q|quit|exit)   cleanup ;;
+    q|quit|exit)   if [ -n "$COCKPIT" ]; then cockpit_leave; else cleanup; fi ;;
     compact)       [ -n "$t" ] && { send_message "${R_TTY[$t]}" "/compact"; CMD_MSG="/compact → session $t"; last_data=0; } ;;
     clear)         [ -n "$t" ] && { send_message "${R_TTY[$t]}" "/clear";   CMD_MSG="/clear → session $t";   last_data=0; } ;;
     model)         [ -n "$t" ] && [ -n "$arg" ] && { send_message "${R_TTY[$t]}" "/model $arg"; CMD_MSG="/model $arg → session $t"; last_data=0; } ;;
@@ -1406,6 +1555,12 @@ show_help() {
   L+=("    ${k}tab${FR}${d}         next session that needs you${FR}")
   L+=("    ${k}digits${FR}${d}      type a row number to jump to its tab — ${k}⏎${d} confirms 1–9${FR}")
   L+=("    ${k}⏎${FR}${d}           jump to the typed row, else attach to the selection${FR}")
+  if [ -n "$COCKPIT" ]; then
+    L+=("    ${k}→${FR}${d}  or ${k}l${FR}${d}     type in the session on the right${FR}")
+    L+=("    ${k}Ctrl-b D${FR}${d}    from the session: back here${FR}")
+    L+=("    ${k}< >${FR}${d}         narrower / wider overview (or drag the divider)${FR}")
+    L+=("    ${k}Ctrl-b d${FR}${d}    from the session: leave the cockpit${FR}")
+  fi
   L+=("")
   L+=("  ${m}act${FR}")
   L+=("    ${k}y${FR}${d} / ${k}n${FR}${d}       approve / deny the permission prompt${FR}")
@@ -1414,7 +1569,11 @@ show_help() {
   L+=("    ${k}v${FR}${d}           speak a status briefing (again / esc to stop)${FR}")
   L+=("    ${k}a${FR}${d}           ask about the fleet by voice (dictate) or text${FR}")
   L+=("    ${k}:${FR}${d}           command mode${FR}")
-  L+=("    ${k}q${FR}${d}           quit the dashboard (sessions keep running)${FR}")
+  if [ -n "$COCKPIT" ]; then
+    L+=("    ${k}q${FR}${d}           leave the cockpit (sessions keep running)${FR}")
+  else
+    L+=("    ${k}q${FR}${d}           quit the dashboard (sessions keep running)${FR}")
+  fi
   L+=("")
   L+=("  ${m}: commands${FR}  ${d}(target = selected row, or a number)${FR}")
   L+=("    ${c}:compact${FR}${d}  ${c}:clear${FR}${d}  ${c}:model <m>${FR}${d}  ${c}:all <msg>${FR}${d}  ${c}:attach [N]${FR}")
@@ -1435,6 +1594,17 @@ cleanup() {
   [ -n "$ASK_OUT" ]  && rm -f "$ASK_OUT" "$ASK_ERR" 2>/dev/null
   [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null   # restore line discipline
   printf '\033[?25h\033[?7h\033[0m\033[?1049l'; exit 0
+}
+# q in the cockpit closes the whole cockpit (there is nothing to go back to in this pane);
+# it asks first, because a stray q would otherwise take the session pane with it.
+cockpit_leave() {
+  prompt_line "${AMBER}leave the cockpit? sessions keep running — type 'y':${RST} "
+  case "$REPLY_LINE" in y|Y|yes) ;; *) CMD_MSG="still here"; return ;; esac
+  [ -n "$SCAN_PID" ] && kill "$SCAN_PID" 2>/dev/null
+  [ -n "$SAY_PID" ]  && kill "$SAY_PID" 2>/dev/null
+  [ -n "$SCAN_TMP" ] && rm -f "$SCAN_TMP" 2>/dev/null
+  [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null
+  exec "$HOME/.local/bin/mini-cockpit" --leave "${COCKPIT#view-}"
 }
 trap cleanup INT TERM
 # On resize just flag it: the interrupted read drops us back to the loop, which
@@ -1486,6 +1656,9 @@ while true; do
     [ -n "$STTY_SAVE" ] && stty "$STTY_SAVE" 2>/dev/null
     exec "$SELF" "${DASH_ARGS[@]}"
   fi
+  # A cockpit nobody is looking at (the laptop is asleep, the connection dropped) stops
+  # scanning and drawing until someone is back.
+  if [ -n "$COCKPIT" ] && ! cockpit_attached; then sleep 2; last_data=0; continue; fi
   compute_geometry
   # After a resize the terminal has reflowed the old frame, so overwriting in
   # place leaves fragments of the old layout behind — wipe the slate first.
@@ -1529,12 +1702,16 @@ while true; do
   printf '\033[H%s%s\033[J%s' "$(printf '%s' "$FRAME" | head -n "$LINES_T")" "$BG_MAIN" "$RST"
 
   read_key
+  [ -n "$KEY" ] && [ -e "$HOME/.claude-dash/debug" ] && clog "key $KEY (goto=$GOTO rows=$NROWS)"
   # Any key other than a digit, ⏎, esc, or a refresh tick cancels a pending
   # "go to session" number so it can't leak into the next action.
   case "$KEY" in [0-9]|ENTER|ESC|'') ;; *) GOTO="" ;; esac
   case "$KEY" in
     UP|k)    move_sel -1 ;;
     DOWN|j)  move_sel +1 ;;
+    RIGHT|l) [ -n "$COCKPIT" ] && cockpit_focus_session ;;
+    '<'|',') [ -n "$COCKPIT" ] && cockpit_side -10 ;;
+    '>'|'.') [ -n "$COCKPIT" ] && cockpit_side +10 ;;
     TAB)     next_alert ;;
     [0-9])
       # Build a row number across keystrokes and show it live in the input bar.
@@ -1569,6 +1746,6 @@ while true; do
     b|B)     broadcast ;;
     ':')     command_mode ;;
     '?')     show_help ;;
-    q|Q)     cleanup ;;
+    q|Q)     if [ -n "$COCKPIT" ]; then cockpit_leave; else cleanup; fi ;;
   esac
 done

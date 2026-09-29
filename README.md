@@ -45,6 +45,8 @@ Yes, `v` talks. The dashboard reads you the state of the fleet through macOS
 speech, which means the laptop across the room can tell you when something
 needs a human. It's a baby monitor for the machines.
 
+In the cockpit (`mini cockpit`, from mini-setup) the dash runs in a narrow pane beside the session: two lines per session, and a row number shows that session in the pane on the right. `→` moves the keyboard to the session, `Ctrl-b D` brings it back, `<` and `>` move the divider, `:new <project>` opens a new chat in the right pane, `q` leaves the cockpit. `DASH_SIDEBAR=1 claude-dash` gives the narrow layout on its own.
+
 A running dash reloads itself when this script changes. No need to quit and relaunch it after an update.
 
 ## Requirements
