@@ -1049,6 +1049,20 @@ tmux_pane_for_tty() { # tmux_pane_for_tty <tty>  -> "session:window.pane" or ""
   tmux list-panes -s -t "$(tmux_my_session)" -F '#{pane_tty} #{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
     | awk -v t="/dev/$1" '$1==t{print $2; exit}'
 }
+# A jump takes a second or two inside tmux (the laptop has to answer). Keys typed meanwhile used
+# to run afterwards as commands of their own. The ⏎ people add after a number out of habit was
+# the worst: "5⏎" opened row 5's tab and then jumped to the SELECTED row, which landed on top.
+# So a jump from the keyboard throws away what was typed during it, and a ⏎ right after is ignored.
+JUMPED_AT=-10
+drain_keys() {
+  local _k
+  # min 0: a read returns at once when nothing is waiting (no -n/-t here: those make bash set
+  # the tty back to blocking for the read; bash 3.2 has no fractional -t)
+  stty min 0 time 0 2>/dev/null || return
+  while IFS= read -r _k; do :; done
+  stty min 1 time 0 2>/dev/null
+}
+jump_to() { focus_tab "$1"; drain_keys; JUMPED_AT=$SECONDS; } # jump_to <tty>
 focus_tab() { # focus_tab <tty>
   if [ -n "$TMUX" ]; then
     local pane; pane=$(tmux_pane_for_tty "$1"); [ -n "$pane" ] || return
@@ -1534,15 +1548,16 @@ while true; do
         gnew="${GOTO}${KEY}"; g=$(( 10#$gnew ))
         if [ "$g" -le "$NROWS" ]; then
           GOTO="$gnew"
-          if [ $(( g * 10 )) -gt "$NROWS" ]; then focus_tab "${R_TTY[$g]}"; GOTO=""; fi
+          if [ $(( g * 10 )) -gt "$NROWS" ]; then jump_to "${R_TTY[$g]}"; GOTO=""; fi
         fi
       fi
       ;;
     ENTER)
       if [ -n "$GOTO" ]; then
         g=$(( 10#$GOTO )); GOTO=""
-        [ "$g" -ge 1 ] && [ "$g" -le "$NROWS" ] && focus_tab "${R_TTY[$g]}"
-      elif [ -n "$SEL_IDX" ]; then focus_tab "${R_TTY[$SEL_IDX]}"; fi ;;
+        [ "$g" -ge 1 ] && [ "$g" -le "$NROWS" ] && jump_to "${R_TTY[$g]}"
+      elif [ $(( SECONDS - JUMPED_AT )) -lt 2 ]; then :   # the ⏎ that followed a number: already there
+      elif [ -n "$SEL_IDX" ]; then jump_to "${R_TTY[$SEL_IDX]}"; fi ;;
     ESC)     GOTO=""; stop_speech ;;
     y|Y)     [ -n "$SEL_IDX" ] && [ "${R_STATUS[$SEL_IDX]}" = waiting ] \
                && { answer_prompt "${R_TTY[$SEL_IDX]}" approve; last_data=0; } ;;
