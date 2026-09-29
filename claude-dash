@@ -291,23 +291,31 @@ rel_time() { # ms epoch -> "3m", "2h", "1d"
 # Claude Code's state file often carries no .name — so pinned tab titles are the
 # name fallback in collect(). One osascript per data scan (~100ms, read-only);
 # returns nothing if Terminal isn't running or no tab has a custom title.
+# Inside tmux (the Mini) every session's tty is a tmux pane, so no Terminal tab
+# can ever match — and there Terminal doesn't answer AppleEvents at all: the
+# call sat out the default 120s timeout, so each scan took two minutes and
+# closed sessions lingered on screen that long. Skip it under tmux, and cap the
+# wait everywhere else so an unresponsive Terminal can't stall a scan again.
 tab_titles() {
+  [ -n "$TMUX" ] && return
   osascript 2>/dev/null <<'APPLESCRIPT'
 if application "Terminal" is not running then return ""
 set out to ""
 set d to character id 9 -- \t ("tab" is shadowed by Terminal's tab class inside the tell)
-tell application "Terminal"
-  repeat with w in windows
-    repeat with t in tabs of w
-      try
-        if title displays custom title of t then
-          set ct to custom title of t
-          if ct is not "" then set out to out & (tty of t) & d & ct & linefeed
-        end if
-      end try
+with timeout of 2 seconds
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        try
+          if title displays custom title of t then
+            set ct to custom title of t
+            if ct is not "" then set out to out & (tty of t) & d & ct & linefeed
+          end if
+        end try
+      end repeat
     end repeat
-  end repeat
-end tell
+  end tell
+end timeout
 return out
 APPLESCRIPT
 }
