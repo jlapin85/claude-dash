@@ -978,15 +978,63 @@ next_alert() { # cycle to the next session in waiting state
 # Inside tmux (the Mac Mini), sessions are tmux panes: match the row's tty to a
 # pane and switch windows / send keys with tmux. No Terminal.app, no Accessibility.
 # Each laptop terminal tab is a grouped tmux session (over its own ssh connection) sharing the
-# same windows. The dash is home base and its tab never changes: a jump brings forward the LAPTOP
-# tab already showing that session, or opens a new tab on it. The Mini can't script the laptop's
-# Terminal, so the dash appends a request to ~/.claude-dash/jumps and dash-jump-listener
-# (mini-setup, running on the laptop) acts on it:
+# same windows. The dash is home base: a jump brings forward the LAPTOP tab already showing that
+# session, or opens a new tab on it. The Mini can't script the laptop's Terminal, so the dash
+# appends a request to ~/.claude-dash/jumps and dash-jump-listener (mini-setup, running on the
+# laptop) acts on it and answers in ~/.claude-dash/acks:
 #   tab <port>    the tab whose ssh connection comes from laptop port <port>
 #   new <window>  no tab shows it: open one attached to that window
+#   answer:       <epoch> ok|fail <the request> [why]
+# A number must ALWAYS land somewhere. The dash used to write the request and report success
+# without knowing: when the laptop side failed, a jump did nothing and said "→ its tab". Now it
+# waits for the answer, and on `fail` or silence it takes the tab you typed in to the session
+# instead (Ctrl-b D comes back) and says why the laptop didn't do it.
 tmux_my_session() { tmux display-message -p '#S' 2>/dev/null; }
 JUMPS_FILE="$HOME/.claude-dash/jumps"
-jump_listener_up() { pgrep -qf "tail -n0 -F $JUMPS_FILE" 2>/dev/null || pgrep -qf "tail -n0 -F ~/.claude-dash/jumps" 2>/dev/null; }
+ACKS_FILE="$HOME/.claude-dash/acks"
+JUMP_WHY=""; HELPER_DOWN_UNTIL=0
+# An answering listener is connected when its ssh command (which carries this marker) is running.
+jump_listener_up() { pgrep -qf -- '-c : dash-jump-listener-v2;' 2>/dev/null; }
+ask_laptop() { # ask_laptop <request> [seconds to wait] -> 0 done, 1 failed/unanswered (why in JUMP_WHY)
+  local req="$1" wait="${2:-3}" before n until l rest st body
+  JUMP_WHY=""
+  if ! jump_listener_up; then JUMP_WHY="laptop helper not connected — run install-laptop.sh on the laptop"; return 1; fi
+  if [ "$(date +%s)" -lt "$HELPER_DOWN_UNTIL" ]; then JUMP_WHY="laptop helper isn't answering"; return 1; fi
+  mkdir -p "${JUMPS_FILE%/*}"; touch "$ACKS_FILE"
+  # keep both files short; tail -F on the other end follows a truncation
+  [ "$(wc -l <"$ACKS_FILE")" -gt 500 ] && : >"$ACKS_FILE"
+  [ "$(wc -l <"$JUMPS_FILE" 2>/dev/null || echo 0)" -gt 500 ] && : >"$JUMPS_FILE"
+  before=$(( $(wc -l <"$ACKS_FILE") ))
+  echo "$req" >>"$JUMPS_FILE"
+  until=$(( SECONDS + wait ))
+  while [ "$SECONDS" -lt "$until" ]; do
+    sleep 0.1
+    n=$(( $(wc -l <"$ACKS_FILE") )); [ "$n" -gt "$before" ] || continue
+    while IFS= read -r l; do
+      rest="${l#* }"; st="${rest%% *}"; body="${rest#* }"
+      [ "${body:0:${#req}}" = "$req" ] || continue
+      [ "$st" = ok ] && return 0
+      JUMP_WHY="${body:${#req}}"; JUMP_WHY="${JUMP_WHY# }"; return 1
+    done < <(tail -n +"$((before+1))" "$ACKS_FILE")
+    before=$n
+  done
+  HELPER_DOWN_UNTIL=$(( $(date +%s) + 30 ))   # don't make the next jumps wait out the same silence
+  JUMP_WHY="laptop helper didn't answer"; return 1
+}
+tmux_dash_session() { # -> session name of the client that just typed into the dash, or ""
+  # Of the clients showing the dash window, the one with the latest activity sent the keypress.
+  local dash_win; dash_win=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)
+  tmux list-clients -F '#{client_activity} #{session_name} #{window_id}' 2>/dev/null \
+    | awk -v dw="$dash_win" '$3==dw' | sort -rn | awk 'NR==1{print $2}'
+}
+show_here() { # show_here <window: @id or =name> [note] -> the tab you typed in goes to that window
+  local me c; me=$(tmux_dash_session); me="${me:-$(tmux_my_session)}"
+  tmux select-window -t "$me:$1" 2>/dev/null
+  # the dash's own status line is out of sight now, so the note goes to the tab you landed in
+  [ -n "$2" ] || return
+  c=$(tmux list-clients -F '#{session_name} #{client_name}' 2>/dev/null | awk -v s="$me" '$1==s{print $2; exit}')
+  [ -n "$c" ] && tmux display-message -c "$c" -d 5000 "$2" 2>/dev/null
+}
 tmux_tab_port() { # tmux_tab_port <window_id> -> laptop-side ssh port of the most recently used tab showing it
   local dash_win cpid spid; dash_win=$(tmux display -p -t "${TMUX_PANE:-}" '#{window_id}' 2>/dev/null)
   [ "$1" = "$dash_win" ] && return
@@ -1007,13 +1055,14 @@ focus_tab() { # focus_tab <tty>
     if [ "$1" = "$DASH_TTY" ]; then tmux select-window -t "$pane" 2>/dev/null; return; fi
     local wid wname port
     wid=$(tmux display -p -t "$pane" '#{window_id}' 2>/dev/null); wname=$(tmux display -p -t "$pane" '#W' 2>/dev/null)
-    if ! jump_listener_up; then
-      CMD_MSG="laptop jump helper isn't running — open a new laptop Terminal window (after install-laptop.sh)"; return
-    fi
-    mkdir -p "${JUMPS_FILE%/*}"
     port=$(tmux_tab_port "$wid")
-    if [ -n "$port" ]; then echo "tab $port" >>"$JUMPS_FILE"; CMD_MSG="→ $wname (its tab)"
-    else echo "new $wname" >>"$JUMPS_FILE"; CMD_MSG="→ $wname (opening a tab for it)"; fi
+    if [ -n "$port" ] && ask_laptop "tab $port"; then CMD_MSG="→ $wname (its tab)"; return; fi
+    # no tab shows it, or the laptop couldn't raise that tab: a new tab, if the laptop is answering
+    if { [ -z "$port" ] || [ "$JUMP_WHY" != "laptop helper didn't answer" ]; } && ask_laptop "new $wname" 4; then
+      CMD_MSG="→ $wname (opened a tab for it)"; return
+    fi
+    CMD_MSG="→ $wname in this tab · Ctrl-b D returns · ${JUMP_WHY}"
+    show_here "$wid" "Ctrl-b D returns to the dash · $JUMP_WHY"
     return
   fi
   osascript >/dev/null 2>&1 <<EOF
@@ -1113,7 +1162,8 @@ broadcast() {
 
 # `:new <project>` — start a Claude session for ~/projects/<project> (or an absolute path).
 # Inside tmux (the Mac Mini): ALWAYS a brand-new chat, same as `p` — mini-new opens its
-# own window (ziplines, ziplines-2, …) and the laptop opens a new tab on it (dash-jump-listener).
+# own window (ziplines, ziplines-2, …) and the laptop opens a new tab on it (dash-jump-listener);
+# if the laptop doesn't, this tab goes to it.
 # Outside tmux: a new Terminal tab running claude there.
 new_session() {
   local arg="$1" dir name
@@ -1123,8 +1173,8 @@ new_session() {
   name="${dir##*/}"
   if [ -n "$TMUX" ]; then
     name=$("$HOME/.local/bin/mini-new" --detached "$dir" 2>/dev/null) || { CMD_MSG="couldn't open $name"; return; }
-    if jump_listener_up; then mkdir -p "${JUMPS_FILE%/*}"; echo "new $name" >>"$JUMPS_FILE"; CMD_MSG="new chat: $name — opening a tab for it"
-    else CMD_MSG="new chat: $name — Ctrl-b w to open it (laptop jump helper isn't running)"; fi
+    if ask_laptop "new $name" 4; then CMD_MSG="new chat: $name — opened a tab for it"
+    else show_here "=$name" "Ctrl-b D returns to the dash · $JUMP_WHY"; CMD_MSG="new chat: $name in this tab · Ctrl-b D returns · ${JUMP_WHY}"; fi
   else
     osascript -e "tell application \"Terminal\" to activate" \
       -e "tell application \"System Events\" to keystroke \"t\" using command down" >/dev/null 2>&1
